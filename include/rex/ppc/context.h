@@ -16,6 +16,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <shared_mutex>
 
 #include <rex/platform/fpscr.h>
 #include <rex/types.h>
@@ -237,6 +238,48 @@ struct FPSCRRegister {
 };
 
 }  // namespace rex::ppc
+
+//=============================================================================
+// PPC Interrupt-Enable (EE) lock primitives
+//
+// [PERF] EE-disable model — replaces the old process-wide recursive_mutex that the
+// REX_*_GLOBAL_LOCK macros used to take (see the codegen init_h template, which now
+// expands those macros against these primitives).
+//
+// The guest mtmsrd instruction toggles the MSR external-interrupt-enable (EE) bit to create
+// "interrupts disabled" critical regions. The recompiler maps `mtmsrd r13` -> ENTER (disable)
+// and `mtmsrd <other>` -> LEAVE (restore). Xenia historically emulated this with ONE process-wide
+// recursive_mutex, which serialized EVERY guest thread whenever any one disabled interrupts — and
+// the job system does that ~tens of thousands of times per frame around tiny lwarx/stwcx
+// interlocked ops. That was the dominant cross-thread contention.
+//
+// Key insight: on real hardware, disabling EE is a PER-CORE operation — it defers interrupt
+// delivery to that core but does NOT provide cross-core mutual exclusion (that comes from
+// lwarx/stwcx reservations, which the recompiler maps to host atomics). So EE-disabled regions on
+// different threads need not exclude each other; they only need to exclude interrupt DELIVERY.
+// We model exactly that with a reader/writer lock:
+//   * guest EE-disable (mtmsrd r13)            -> SHARED   (run concurrently across guest threads)
+//   * interrupt dispatch (ExecuteInterrupt)    -> EXCLUSIVE (waits for all EE regions; blocks new)
+// Cross-thread safety of the protected interlocked ops is unchanged (host-atomic lwarx/stwcx),
+// and "interrupts disabled blocks interrupt delivery" is preserved by the shared/exclusive pairing.
+inline std::shared_mutex& ppc_ee_mutex() {
+  static std::shared_mutex m;
+  return m;
+}
+// Per-thread EE-disable nesting depth. Only the OUTERMOST mtmsrd takes the shared lock — a thread
+// must hold at most one shared lock at a time (recursive shared locking can deadlock behind a
+// pending exclusive waiter).
+inline int32_t& ppc_ee_depth() {
+  static thread_local int32_t depth = 0;
+  return depth;
+}
+// True on the thread currently servicing an interrupt (it holds ppc_ee_mutex EXCLUSIVELY). While
+// set, nested guest mtmsrd on that thread only adjusts the depth and does NOT take the shared lock,
+// which would self-deadlock against the thread's own exclusive hold.
+inline bool& ppc_ee_in_interrupt() {
+  static thread_local bool in_interrupt = false;
+  return in_interrupt;
+}
 
 using PPCRegister = rex::ppc::Register;
 using PPCXERRegister = rex::ppc::XERRegister;

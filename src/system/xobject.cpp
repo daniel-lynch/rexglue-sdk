@@ -9,9 +9,15 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <shared_mutex>
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/platform.h>  // REX_PLATFORM_WIN32 (guards the POSIX-only SIGUSR2 A/B toggle below)
+#if !REX_PLATFORM_WIN32
+#include <csignal>
+#endif
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
@@ -28,6 +34,26 @@
 #include <rex/system/xthread.h>
 
 namespace rex::system {
+
+namespace {
+// [BO-PERF] runtime A/B toggle for the lock-free GetNativeObject fast path (measurement only —
+// STRIP before upstream). Default ON (lock-free). `kill -USR2 <pid>` flips it so the SAME held-still
+// scene can be measured lock-free vs the old shared_lock path back-to-back in ONE process, removing
+// run-to-run variance. Safe to flip live: StashHandle always runs under the exclusive lock and
+// publishes via release store, so a lock-free reader pairs via acquire and a shared reader is
+// mutex-excluded, in either mode and across a flip.
+std::atomic<bool> g_native_lockfree{true};
+#if !REX_PLATFORM_WIN32
+void bo_native_toggle(int) {
+  g_native_lockfree.store(!g_native_lockfree.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+}
+struct BoNativeToggleInstaller {
+  BoNativeToggleInstaller() { std::signal(SIGUSR2, bo_native_toggle); }
+};
+BoNativeToggleInstaller g_bo_native_toggle_installer;
+#endif  // !REX_PLATFORM_WIN32 (SIGUSR2 is POSIX-only; on Windows the flag keeps its default)
+}  // namespace
 
 XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
   handles_.reserve(10);
@@ -375,72 +401,100 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
   // We identify this by setting wait_list_flink to a magic value. When set,
   // wait_list_blink will hold a handle to our object.
 
-  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+  // Dedicated lock for native dispatcher-object resolution. Only first-use creation takes it
+  // EXCLUSIVE; the already-initialized read path is LOCK-FREE (see below). This is the dominant
+  // ~50k/frame resolution that bottlenecked frame rate; serializing it on a mutex — even a
+  // shared one, whose reader-count cache line still bounces across all guest threads — is the
+  // cost we remove. Safety: the signature/handle fields (wait_list_flink/blink) are touched
+  // ONLY here and by StashHandle (reached only from this function's create path). The object's
+  // handle is registered in the object_table by the XObject ctor (AddHandle) BEFORE StashHandle
+  // publishes the signature, so any reader that observes the signature resolves a fully-built,
+  // fully-registered object. Lock order: native -> table (LookupObject/AddHandle); creation
+  // never takes the global lock.
+  static std::shared_mutex native_object_mutex;
 
   auto header = reinterpret_cast<X_DISPATCH_HEADER*>(native_ptr);
+
+  // Fast path: already initialized — LOCK-FREE. Acquire-load the signature so that observing it
+  // happens-after StashHandle's release-store, which guarantees the handle (written first) and
+  // the object's table registration are visible. The plain blink read below is safe under that
+  // acquire. Pairs with StashHandle's release store in xobject.h.
+  // (The g_native_lockfree branch is a [BO-PERF] A/B toggle — STRIP before upstream; keep only the
+  // lock-free arm.)
+  if (g_native_lockfree.load(std::memory_order_relaxed)) {
+    std::atomic_ref<uint32_t> flink_ref(header->wait_list_flink.value);
+    if (rex::byte_swap<uint32_t>(flink_ref.load(std::memory_order_acquire)) == kXObjSignature) {
+      uint32_t handle = header->wait_list_blink;
+      return kernel_state->object_table()->LookupObject<XObject>(handle);
+    }
+  } else {
+    std::shared_lock<std::shared_mutex> lock(native_object_mutex);
+    if (header->wait_list_flink == kXObjSignature) {
+      uint32_t handle = header->wait_list_blink;
+      return kernel_state->object_table()->LookupObject<XObject>(handle);
+    }
+  }
+
+  // Slow path: first use. Take the exclusive lock and re-check under it (another thread may
+  // have initialized this object while we were upgrading).
+  std::unique_lock<std::shared_mutex> lock(native_object_mutex);
+  if (header->wait_list_flink == kXObjSignature) {
+    uint32_t handle = header->wait_list_blink;
+    return kernel_state->object_table()->LookupObject<XObject>(handle);
+  }
 
   if (as_type == -1) {
     as_type = header->type;
   }
 
-  if (header->wait_list_flink == kXObjSignature) {
-    // Already initialized.
-    // TODO: assert if the type of the object != as_type
-    uint32_t handle = header->wait_list_blink;
-    auto object = kernel_state->object_table()->LookupObject<XObject>(handle);
-
-    // TODO(benvanik): assert nothing has been changed in the struct.
-    return object;
-  } else {
-    // First use, create new.
-    // https://www.nirsoft.net/kernel_struct/vista/KOBJECTS.html
-    XObject* object = nullptr;
-    switch (as_type) {
-      case 0:  // EventNotificationObject
-      case 1:  // EventSynchronizationObject
-      {
-        auto ev = new XEvent(kernel_state);
-        ev->InitializeNative(native_ptr, header);
-        object = ev;
-      } break;
-      case 2:  // MutantObject
-      {
-        auto mutant = new XMutant(kernel_state);
-        mutant->InitializeNative(native_ptr, header);
-        object = mutant;
-      } break;
-      case 5:  // SemaphoreObject
-      {
-        auto sem = new XSemaphore(kernel_state);
-        auto success = sem->InitializeNative(native_ptr, header);
-        // Can't report failure to the guest at late initialization:
-        assert_true(success);
-        object = sem;
-      } break;
-      case 3:   // ProcessObject
-      case 4:   // QueueObject
-      case 6:   // ThreadObject
-      case 7:   // GateObject
-      case 8:   // TimerNotificationObject
-      case 9:   // TimerSynchronizationObject
-      case 18:  // ApcObject
-      case 19:  // DpcObject
-      case 20:  // DeviceQueueObject
-      case 21:  // EventPairObject
-      case 22:  // InterruptObject
-      case 23:  // ProfileObject
-      case 24:  // ThreadedDpcObject
-      default:
-        assert_always();
-        return NULL;
-    }
-
-    // Stash pointer in struct.
-    // FIXME: This assumes the object contains a dispatch header (some don't!)
-    StashHandle(header, object->handle());
-
-    return object_ref<XObject>(object);
+  // First use, create new.
+  // https://www.nirsoft.net/kernel_struct/vista/KOBJECTS.html
+  XObject* object = nullptr;
+  switch (as_type) {
+    case 0:  // EventNotificationObject
+    case 1:  // EventSynchronizationObject
+    {
+      auto ev = new XEvent(kernel_state);
+      ev->InitializeNative(native_ptr, header);
+      object = ev;
+    } break;
+    case 2:  // MutantObject
+    {
+      auto mutant = new XMutant(kernel_state);
+      mutant->InitializeNative(native_ptr, header);
+      object = mutant;
+    } break;
+    case 5:  // SemaphoreObject
+    {
+      auto sem = new XSemaphore(kernel_state);
+      auto success = sem->InitializeNative(native_ptr, header);
+      // Can't report failure to the guest at late initialization:
+      assert_true(success);
+      object = sem;
+    } break;
+    case 3:   // ProcessObject
+    case 4:   // QueueObject
+    case 6:   // ThreadObject
+    case 7:   // GateObject
+    case 8:   // TimerNotificationObject
+    case 9:   // TimerSynchronizationObject
+    case 18:  // ApcObject
+    case 19:  // DpcObject
+    case 20:  // DeviceQueueObject
+    case 21:  // EventPairObject
+    case 22:  // InterruptObject
+    case 23:  // ProfileObject
+    case 24:  // ThreadedDpcObject
+    default:
+      assert_always();
+      return NULL;
   }
+
+  // Stash pointer in struct.
+  // FIXME: This assumes the object contains a dispatch header (some don't!)
+  StashHandle(header, object->handle());
+
+  return object_ref<XObject>(object);
 }
 
 }  // namespace rex::system

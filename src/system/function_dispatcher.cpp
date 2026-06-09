@@ -132,7 +132,20 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
   SCOPE_profile_cpu_f("cpu");
   PROFILE_INTERRUPT_DISPATCHED();
 
-  // Hold the global lock during interrupt dispatch.
+  // [PERF] EE model (see ppc/context.h): take the EE lock EXCLUSIVELY first so interrupt dispatch
+  // blocks while any guest thread is in an EE-disabled (interrupts-off) region and prevents new
+  // ones from starting until the handler returns — the same exclusion the old single process-wide
+  // lock provided, but now guest EE regions run concurrently with each other (shared). Lock order
+  // is always ee-before-kernel. The handler is guest code that will itself mtmsrd, so mark this
+  // thread "in interrupt" — nested EE toggles then only adjust the per-thread depth instead of
+  // trying to re-take the shared lock (which would self-deadlock against this exclusive hold).
+  std::unique_lock<std::shared_mutex> ee_lock(ppc_ee_mutex());
+  struct EeInterruptScope {
+    EeInterruptScope() { ppc_ee_in_interrupt() = true; }
+    ~EeInterruptScope() { ppc_ee_in_interrupt() = false; }
+  } ee_interrupt_scope;
+
+  // Hold the global (kernel) lock during interrupt dispatch to protect kernel structures.
   auto global_lock = global_critical_region_.Acquire();
 
   auto* ctx = thread_state->context();

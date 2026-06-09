@@ -288,28 +288,35 @@ inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
 // Interrupt Locks
 //=============================================================================
 
-inline std::atomic<i32>& ppc_global_lock_count_() {
-  static std::atomic<i32> count{0};
-  return count;
-}
+// [PERF] EE-disable model — the primitives ppc_ee_mutex()/ppc_ee_depth()/ppc_ee_in_interrupt()
+// live in rex/ppc/context.h (an SDK header, so FunctionDispatcher::ExecuteInterrupt can take the
+// matching EXCLUSIVE lock). See the long rationale there. The macros below expand against them in
+// generated guest code: guest mtmsrd EE-disable runs SHARED (concurrent across guest threads);
+// interrupt dispatch runs EXCLUSIVE. Replaces the old process-wide recursive_mutex that serialized
+// every guest thread around tiny interlocked ops.
 
-#define REX_CHECK_GLOBAL_LOCK()                                        \
-  ([&]() -> u64 {                                                      \
-    auto lock_ = rex::thread::global_critical_region::AcquireDirect(); \
-    return ppc_global_lock_count_().load() ? 0 : 0x8000;               \
-  }())
+// Check EE state (for mfmsr): 0x8000 if interrupts ENABLED, 0 if disabled. Per-thread, lock-free
+// (and more correct than the old global count — mfmsr reports the CURRENT thread's MSR).
+#define REX_CHECK_GLOBAL_LOCK() (ppc_ee_depth() ? u64(0) : u64(0x8000))
 
-#define REX_ENTER_GLOBAL_LOCK()                          \
-  do {                                                   \
-    rex::thread::global_critical_region::mutex().lock(); \
-    ppc_global_lock_count_().fetch_add(1);               \
+// Enter EE-disabled region (mtmsrd from r13). Only the OUTERMOST takes the shared lock.
+#define REX_ENTER_GLOBAL_LOCK()         \
+  do {                                  \
+    if (ppc_ee_in_interrupt()) {        \
+      ++ppc_ee_depth();                 \
+    } else if (ppc_ee_depth()++ == 0) { \
+      ppc_ee_mutex().lock_shared();     \
+    }                                   \
   } while (0)
 
-#define REX_LEAVE_GLOBAL_LOCK()                                                           \
-  do {                                                                                    \
-    auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
-    assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
-    rex::thread::global_critical_region::mutex().unlock();                                \
+// Leave EE-disabled region (mtmsrd from non-r13).
+#define REX_LEAVE_GLOBAL_LOCK()         \
+  do {                                  \
+    if (ppc_ee_in_interrupt()) {        \
+      --ppc_ee_depth();                 \
+    } else if (--ppc_ee_depth() == 0) { \
+      ppc_ee_mutex().unlock_shared();   \
+    }                                   \
   } while (0)
 
 //=============================================================================

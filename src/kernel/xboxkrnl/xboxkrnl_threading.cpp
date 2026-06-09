@@ -965,6 +965,16 @@ static void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
 // PPCContext* provides r13 (PCR address) without needing XThread::GetCurrentThread().
 uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_irql) {
   uint32_t old_irql = change_irql ? xeKfRaiseIrql(ctx, IRQL_DISPATCH) : 0;
+  // Hold the global critical region for the lifetime of the guest spinlock
+  // (matching upstream Xenia). Guest spinlocks model raised IRQL / disabled
+  // interrupts, so they must serialize against interrupt dispatch
+  // (FunctionDispatcher::ExecuteInterrupt also holds the global lock for the whole
+  // handler). Without this, guest threads take locks in order {spinlock -> global}
+  // while interrupt dispatch takes {global -> spinlock} -- a lock-order inversion
+  // that deadlocks (e.g. a GPU command-stream interrupt vs. the CP/memory paths).
+  // The mutex is recursive, so nested spinlocks and re-entrant global-lock holders
+  // are safe. Balanced by the unlock in xeKeKfReleaseSpinLock.
+  rex::thread::global_critical_region::mutex().lock();
   uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
   assert_true(lock->prcb_of_owner != rex::byte_swap(pcr_addr));  // deadlock detection
   while (!rex::thread::atomic_cas(0u, rex::byte_swap(pcr_addr), &lock->prcb_of_owner.value)) {
@@ -977,6 +987,9 @@ void xeKeKfReleaseSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, uint32_t old_irql
                            bool change_irql) {
   assert_true(lock->prcb_of_owner == static_cast<uint32_t>(ctx->r13.u64));
   rex::thread::atomic_store_release(0u, &lock->prcb_of_owner.value);
+  // Release the global critical region acquired in xeKeKfAcquireSpinLock (or in
+  // the KeTryToAcquireSpinLockAtRaisedIrql success path).
+  rex::thread::global_critical_region::mutex().unlock();
   if (change_irql && old_irql < IRQL_DISPATCH) {
     xeKfLowerIrql(ctx, static_cast<unsigned char>(old_irql));
   }
@@ -1063,7 +1076,12 @@ u32 KeTryToAcquireSpinLockAtRaisedIrql_entry(mapped_u32 lock_ptr) {
   auto lock = reinterpret_cast<X_KSPINLOCK*>(lock_ptr.host_address());
   auto* ctx = current_ppc_context();
   uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
+  // Mirror xeKeKfAcquireSpinLock's global-lock acquisition. On a successful try the
+  // global lock stays held (released later by xeKeKfReleaseSpinLock); on failure we
+  // drop it again so it stays balanced.
+  rex::thread::global_critical_region::mutex().lock();
   if (!rex::thread::atomic_cas(0u, rex::byte_swap(pcr_addr), &lock->prcb_of_owner.value)) {
+    rex::thread::global_critical_region::mutex().unlock();
     return 0;
   }
   return 1;
