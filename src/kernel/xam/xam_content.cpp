@@ -145,6 +145,11 @@ ppc_u32_result_t xeXamContentCreate(ppc_u32_t user_index, ppc_pchar_t root_name,
     *disposition_ptr = 0;
   }
 
+  REXKRNL_INFO("XamContentCreate: root='{}' file='{}' type={:08X} device_id={:08X} flags={:02X}",
+               root_name.value(), content_data.file_name(),
+               static_cast<uint32_t>(XContentType(content_data.content_type)), uint32_t(content_data.device_id),
+               uint32_t(flags));
+
   auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
               disposition_ptr,
               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
@@ -219,6 +224,9 @@ ppc_u32_result_t xeXamContentCreate(ppc_u32_t user_index, ppc_pchar_t root_name,
     } else if (disposition == kDispositionState::Open) {
       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
     }
+
+    REXKRNL_INFO("XamContentCreate result: root='{}' file='{}' disp={} -> {:08X}",
+                 root_name, content_data.file_name(), uint32_t(disposition), uint32_t(result));
 
     if (license_mask_ptr && XSUCCEEDED(result)) {
       *license_mask_ptr = content_license;

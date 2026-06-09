@@ -111,6 +111,12 @@ static_assert_size(X_CONTENT_DEVICE_DATA, 0x50);
 
 ppc_u32_result_t XamContentGetDeviceData_entry(ppc_u32_t device_id,
                                                ppc_ptr_t<X_CONTENT_DEVICE_DATA> device_data) {
+  REXKRNL_INFO("XamContentGetDeviceData: device_id={:08X}", uint32_t(device_id));
+  // device_id=0 means "no device selected yet" (game global uninitialized at startup).
+  // Default to HDD so device-state checks succeed before the user selects a device.
+  if (device_id == 0) {
+    device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
+  }
   auto device_info = GetDummyDeviceInfo(device_id);
   if (device_info == nullptr) {
     return X_ERROR_DEVICE_NOT_CONNECTED;

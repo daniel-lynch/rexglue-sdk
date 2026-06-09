@@ -490,6 +490,18 @@ void VdSwap_entry(ppc_pvoid_t buffer_ptr,      // ptr into primary ringbuffer
 
   auto texture_format = rex::graphics::xenos::TextureFormat(texture_format_ptr.value());
   auto color_space = *color_space_ptr;
+  // [BO-SWAP] log the swap format/colorspace on change — to see if the blown-out video uses a
+  // different (HDR) frontbuffer format than the menu (which renders fine).
+  {
+    static uint32_t s_last_fmt = 0xFFFFFFFFu, s_last_cs = 0xFFFFFFFFu;
+    if (uint32_t(texture_format) != s_last_fmt || color_space != s_last_cs) {
+      s_last_fmt = uint32_t(texture_format);
+      s_last_cs = color_space;
+      REXKRNL_WARN("[BO-SWAP] frontbuffer format={} color_space={} {}x{}",
+                   uint32_t(texture_format), uint32_t(color_space), uint32_t(*width),
+                   uint32_t(*height));
+    }
+  }
   assert_true(texture_format == rex::graphics::xenos::TextureFormat::k_8_8_8_8 ||
               texture_format == rex::graphics::xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16);
   assert_true(color_space == 0);  // RGB(0)
