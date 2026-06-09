@@ -11,6 +11,9 @@
 
 #pragma once
 
+#include <cstdint>
+#include <filesystem>
+
 #include <rex/system/xtypes.h>
 
 // Forward declarations
@@ -33,6 +36,10 @@ class IGraphicsSystem {
                          KernelState* kernel_state, ui::WindowedAppContext* app_context,
                          bool with_presentation) = 0;
   virtual void Shutdown() = 0;
+  // Initialize the persistent shader/pipeline storage for the title (disk cache so
+  // shaders aren't recompiled from scratch every run). Implemented by GraphicsSystem.
+  virtual void InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                       uint32_t title_id, bool blocking) = 0;
 };
 
 }  // namespace rex::system

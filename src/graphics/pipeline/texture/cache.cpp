@@ -17,6 +17,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/graphics/bo_load_probe.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -388,6 +389,19 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   pending_range_count_out = 0;
 
   TextureKey texture_key = texture.key();
+  // [BO-LOAD] confirm thrashing: log the re-loaded texture's key (base_page/dims/format) so we can
+  // see if the SAME textures reload every frame. Env BO_TEXLOG=1, throttled to avoid per-frame spam.
+  if (std::getenv("BO_TEXLOG")) {
+    static std::atomic<uint32_t> s_n{0};
+    uint32_t n = s_n.fetch_add(1);
+    if (n % 64 == 0) {
+      REXGPU_WARN("[BO-TEX] reload key: base_page=0x{:X} mip_page=0x{:X} {}x{} fmt={} base_out={} "
+                  "mips_out={} (sample #{})",
+                  uint32_t(texture_key.base_page), uint32_t(texture_key.mip_page),
+                  texture_key.GetWidth(), texture_key.GetHeight(),
+                  uint32_t(texture_key.format), int(base_outdated), int(mips_outdated), n);
+    }
+  }
   if (base_outdated) {
     PendingSharedMemoryRange pending_range;
     pending_range.start = texture_key.base_page << 12;
@@ -444,6 +458,9 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 }
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+  // [BO-CP] time the per-draw texture sync phase (PrepareTextureLoad + re-upload submit), part of
+  // cp_exec — tells us how much of frame time the RT-texture thrashing actually costs the CPU.
+  bo_load::ScopedTally _bo_texreq(nullptr, &bo_load::cp_texreq_ns);
   const auto& regs = register_file();
 
   if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
@@ -743,6 +760,9 @@ void TextureCache::Texture::WatchCallback(
 void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {
+  // [BO-LOAD] who keeps invalidating textures? GPU writes (resolve/shared-mem) vs CPU/guest.
+  (invalidated_by_gpu ? bo_load::tex_inval_gpu : bo_load::tex_inval_cpu)
+      .fetch_add(1, std::memory_order_relaxed);
   Texture& texture = *static_cast<Texture*>(context);
   texture.WatchCallback(global_lock, argument != 0);
   texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);

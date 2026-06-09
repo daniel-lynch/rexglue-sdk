@@ -21,6 +21,7 @@
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/chrono/clock.h>
+#include <rex/graphics/bo_load_probe.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
@@ -287,6 +288,8 @@ void CommandProcessor::WorkerThreadMain() {
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
+      // [BO-CP] time spent waiting for the guest to produce ring commands (guest-CPU-bound if high).
+      bo_load::ScopedTally _bo_wait(nullptr, &bo_load::cp_wait_ns);
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
@@ -313,7 +316,11 @@ void CommandProcessor::WorkerThreadMain() {
     assert_true(read_ptr_index_ != write_ptr_index);
 
     // Execute. Note that we handle wraparound transparently.
-    read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    // [BO-CP] time spent executing ring commands (draws/resolves/swap) — draw/GPU-bound if high.
+    {
+      bo_load::ScopedTally _bo_exec(nullptr, &bo_load::cp_exec_ns);
+      read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    }
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.

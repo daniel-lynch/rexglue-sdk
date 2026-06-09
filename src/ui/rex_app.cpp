@@ -20,6 +20,7 @@
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
+#include <rex/graphics/bo_load_probe.h>  // [BO-*] g_hud snapshot for the F3 overlay
 #include <rex/graphics/graphics_system.h>
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
@@ -28,6 +29,7 @@
 #include <rex/graphics/d3d12/graphics_system.h>
 #endif
 #include <rex/audio/audio_system.h>
+#include <rex/audio/nop/nop_audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
@@ -40,6 +42,7 @@
 #include <imgui.h>
 
 #include <filesystem>
+#include <thread>
 
 REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
@@ -132,7 +135,14 @@ bool ReXApp::OnInitialize() {
 #elif REX_HAS_VULKAN
   config.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
 #endif
-  config.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
+  // [PERF A/B] BO_NOAUDIO=1 swaps in the nop audio backend (no driver -> guest audio
+  // callback effectively stops firing) to measure whether audio CPU + global-lock traffic
+  // gates frame rate. Default remains SDL.
+  if (std::getenv("BO_NOAUDIO")) {
+    config.audio_factory = REX_AUDIO_BACKEND(rex::audio::nop::NopAudioSystem);
+  } else {
+    config.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
+  }
   config.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config.kernel_init = rex::kernel::InitializeKernel;
 
@@ -215,6 +225,30 @@ bool ReXApp::OnInitialize() {
         imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, immediate_drawer_.get());
         // Built-in overlays
         debug_overlay_ = std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get());
+        // Feed the F3 overlay from the rexglue [BO-*] per-frame snapshot (guest FPS + the CP
+        // breakdown / GPU latency / texture-streaming metrics). Published every swap by the
+        // command processor into bo_load::g_hud; read here lock-free (display only).
+        debug_overlay_->SetStatsProvider([]() -> ui::FrameStats {
+          namespace bl = rex::graphics::bo_load;
+          ui::FrameStats s;
+          s.frame_count = bl::g_hud.updates.load(std::memory_order_relaxed);
+          if (s.frame_count == 0) {
+            return s;  // not yet populated -> overlay shows host FPS only
+          }
+          s.frame_time_ms = bl::g_hud.frame_ms.load(std::memory_order_relaxed);
+          s.fps = s.frame_time_ms > 0.0 ? 1000.0 / s.frame_time_ms : 0.0;
+          s.extended = true;
+          s.cp_wait_ms = bl::g_hud.cp_wait_ms.load(std::memory_order_relaxed);
+          s.cp_exec_ms = bl::g_hud.cp_exec_ms.load(std::memory_order_relaxed);
+          s.await_avg_ms = bl::g_hud.await_avg_ms.load(std::memory_order_relaxed);
+          s.await_max_ms = bl::g_hud.await_max_ms.load(std::memory_order_relaxed);
+          s.tex_mb = bl::g_hud.tex_mb.load(std::memory_order_relaxed);
+          s.tex_count = bl::g_hud.tex_count.load(std::memory_order_relaxed);
+          s.inval_gpu = bl::g_hud.inval_gpu.load(std::memory_order_relaxed);
+          s.inval_cpu = bl::g_hud.inval_cpu.load(std::memory_order_relaxed);
+          s.draws = bl::g_hud.draws.load(std::memory_order_relaxed);
+          return s;
+        });
         console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
         settings_overlay_ = std::make_unique<ui::SettingsDialog>(
             imgui_drawer_.get(), exe_dir / (std::string(GetName()) + ".toml"));
@@ -270,10 +304,16 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
   REXLOG_INFO("Window closing, shutting down...");
   shutting_down_.store(true, std::memory_order_release);
-  if (runtime_ && runtime_->kernel_state()) {
-    runtime_->kernel_state()->TerminateTitle();
-  }
+  // Quit the GTK loop immediately so OnClosing() can return.
+  // TerminateTitle() can block indefinitely on POSIX when GPU threads are
+  // parked on Vulkan fences that won't reach a pthread cancellation point.
+  // Running it detached lets the GTK loop exit; _exit() in main() then kills
+  // the process before the join can block.
   app_context().QuitFromUIThread();
+  if (runtime_ && runtime_->kernel_state()) {
+    auto* ks = runtime_->kernel_state();
+    std::thread([ks]() { ks->TerminateTitle(); }).detach();
+  }
 }
 
 void ReXApp::OnDestroy() {

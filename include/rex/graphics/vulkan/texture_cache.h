@@ -201,6 +201,7 @@ class VulkanTextureCache final : public TextureCache {
     ~VulkanTexture();
 
     VkImage image() const { return image_; }
+    Usage usage() const { return usage_; }
 
     // Doesn't transition (the caller must insert the barrier).
     Usage SetUsage(Usage new_usage) {

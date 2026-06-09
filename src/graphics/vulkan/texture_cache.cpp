@@ -13,6 +13,8 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+
+#include <rex/graphics/bo_load_probe.h>
 #include <utility>
 
 #include <rex/assert.h>
@@ -237,7 +239,16 @@ const VulkanTextureCache::HostFormatPair VulkanTextureCache::kBestHostFormats[64
     // k_16_16_16_16
     // VK_FORMAT_R16G16B16A16_UNORM and VK_FORMAT_R16G16B16A16_SNORM are
     // optional.
-    {{kLoadShaderIndex64bpb, VK_FORMAT_R16G16B16A16_UNORM},
+    // Both signedness slots use SNORM: the Xenos k_16_16_16_16 color render target
+    // stores signed-normalized data, so when such an RT is resolved and re-read as a
+    // texture, the host texture format must match the host RT storage (SNORM). The
+    // engine fetches these HDR buffers with the "unsigned" sign flag (swizzled_signs=0);
+    // mapping that to UNORM reinterprets the signed bits as unsigned, corrupting the
+    // HDR values fed to the fullscreen tonemap -> the 3D scene blows out to uniform
+    // white (the IW-engine main menu; the Xenia RDR "Vulkan 3D-white / 2D-fine" class).
+    // Trade-off: a genuinely-unsigned k_16_16_16_16 *guest-memory* texture (rare for this
+    // 64bpp HDR format) would read half-range; not observed in the supported titles.
+    {{kLoadShaderIndex64bpb, VK_FORMAT_R16G16B16A16_SNORM},
      {kLoadShaderIndex64bpb, VK_FORMAT_R16G16B16A16_SNORM},
      xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA,
      true},
@@ -1211,6 +1222,10 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
 
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
+  // [BO-LOAD] time the CPU cost of the upload path (guest RAM -> scratch buffer + compute load
+  // dispatch recording). count=null here; the per-texture count+bytes are tallied below once the
+  // host size is known.
+  rex::graphics::bo_load::ScopedTally _bo_tex_time(nullptr, &rex::graphics::bo_load::texture_upload_ns);
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
 
@@ -1271,6 +1286,32 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   uint32_t depth_or_array_size = texture_key.GetDepthOrArraySize();
   uint32_t depth = is_3d ? depth_or_array_size : 1;
   uint32_t array_size = is_3d ? 1 : depth_or_array_size;
+
+  // RT->texture bridge: if this base level was just resolved from a color render
+  // target whose image still holds that content, copy it image-to-image and skip
+  // the guest-RAM upload entirely. Restricted to the trivially-correct case (full
+  // 2D surface, single layer, no mips, scale 1, uncompressed host format); the RT
+  // cache rejects anything that doesn't match exactly, in which case we fall
+  // through to the normal resident-memory upload below.
+  if (REXCVAR_GET(rt_texture_bridge) && load_base &&
+      dimension == xenos::DataDimension::k2DOrStacked && texture_key.mip_max_level == 0 &&
+      !texture_key.scaled_resolve && depth_or_array_size == 1 && !host_format.block_compressed) {
+    VulkanRenderTargetCache* rt_cache = command_processor_.render_target_cache();
+    if (rt_cache) {
+      VkPipelineStageFlags texture_cur_stage;
+      VkAccessFlags texture_cur_access;
+      VkImageLayout texture_cur_layout;
+      GetTextureUsageMasks(vulkan_texture.usage(), texture_cur_stage, texture_cur_access,
+                           texture_cur_layout);
+      if (rt_cache->TryBridgeResolvedColorToTexture(
+              texture_key.base_page << 12, width, height, host_format.format,
+              vulkan_texture.image(), texture_cur_stage, texture_cur_access, texture_cur_layout)) {
+        vulkan_texture.SetUsage(VulkanTexture::Usage::kTransferDestination);
+        vulkan_texture.MarkAsUsed();
+        return true;
+      }
+    }
+  }
   xenos::TextureFormat guest_format = texture_key.format;
   const FormatInfo* guest_format_info = FormatInfo::Get(guest_format);
   uint32_t block_width = guest_format_info->block_width;
@@ -1360,6 +1401,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         level_host_layout.y_pitch_blocks * level_guest_z_extent_texels;
     host_buffer_size += level_host_layout.slice_size_bytes * array_size;
   }
+  // [BO-LOAD] account this texture upload + its host byte size (the streaming half of a load).
+  rex::graphics::bo_load::textures_uploaded.fetch_add(1, std::memory_order_relaxed);
+  rex::graphics::bo_load::texture_upload_bytes.fetch_add(uint64_t(host_buffer_size),
+                                                         std::memory_order_relaxed);
   VulkanCommandProcessor::ScratchBufferAcquisition scratch_buffer_acquisition(
       command_processor_.AcquireScratchGpuBuffer(
           host_buffer_size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT));

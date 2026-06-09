@@ -1,3 +1,4 @@
+#include <atomic>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -11,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <tuple>
@@ -477,6 +479,14 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       edram_bases[rt_bit_index] = color_info.color_base;
       xenos::ColorRenderTargetFormat color_format =
           regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]).color_format;
+      if (std::getenv("BO_RTFMT")) {  // [BO-RTFMT] log distinct color RT formats (video vs menu)
+        static uint32_t s_seen = 0;
+        uint32_t fb = uint32_t(1) << uint32_t(color_format);
+        if (!(s_seen & fb)) {
+          s_seen |= fb;
+          REXGPU_WARN("[BO-RTFMT] new color RT format={} (enum)", uint32_t(color_format));
+        }
+      }
       bool is_64bpp = xenos::IsColorRenderTargetFormat64bpp(color_format);
       if (is_64bpp) {
         rts_are_64bpp |= uint32_t(1) << rt_bit_index;

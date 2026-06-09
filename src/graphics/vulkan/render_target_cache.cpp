@@ -1,3 +1,4 @@
+#include <atomic>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -39,6 +40,12 @@
 
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(rt_texture_bridge, false, "GPU/Vulkan",
+                    "Bridge resolved color render targets directly into textures with an "
+                    "image-to-image GPU copy, skipping the guest-RAM round-trip re-upload "
+                    "(experimental; full-surface, scale 1, MSAA 1x, matching format only).")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // DEFINE_string(
@@ -1133,6 +1140,9 @@ void VulkanRenderTargetCache::EndSubmission() {
   if (transfer_vertex_buffer_pool_) {
     transfer_vertex_buffer_pool_->FlushWrites();
   }
+  // Bound the lifetime of RT->texture bridge entries to a single submission so
+  // they never outlive the render-target images they point at.
+  resolved_color_rts_.clear();
 }
 
 void VulkanRenderTargetCache::ResetTraceDownload() {
@@ -1349,6 +1359,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     return true;
   }
 
+
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -1492,6 +1503,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                             resolve_info.copy_dest_extent_length);
+          if (REXCVAR_GET(rt_texture_bridge)) {
+            RecordResolvedColorRT(resolve_info, draw_resolution_scaled);
+          }
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
@@ -1690,6 +1704,17 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
             vulkan_rt.current_stage_mask(), rt_dst_stage_mask, vulkan_rt.current_access_mask(),
             rt_dst_access_mask, vulkan_rt.current_layout(), rt_new_layout);
         vulkan_rt.SetUsage(rt_dst_stage_mask, rt_dst_access_mask, rt_new_layout);
+        // Bump the content generation so any RT->texture bridge entry recorded
+        // from an earlier resolve of this image is treated as stale. NOTE: this
+        // MUST bump on every bind of an accumulated RT, not just draws that
+        // write it. The full-res scene targets (e.g. base 0x1F140000/0x1F4D8000)
+        // are re-modified after their resolve every frame via NON-draw paths
+        // (resolve-clears / EDRAM ownership transfers), so a narrower "only on
+        // actual draw" bump misses those rewrites and the bridge copies stale
+        // content -> red flicker in-game (proven empirically). Conservative is
+        // correct: these scene targets must MISS the bridge; only the
+        // resolve-then-immediately-sampled surfaces (bloom chain) safely hit.
+        vulkan_rt.MarkDrawn();
       }
     } break;
 
@@ -2023,6 +2048,11 @@ VkFormat VulkanRenderTargetCache::GetColorOwnershipTransferVulkanFormat(
 }
 
 VulkanRenderTargetCache::VulkanRenderTarget::~VulkanRenderTarget() {
+  // Drop any RT->texture bridge entries before this image goes away so the side
+  // table can never dereference a destroyed render target.
+  if (!render_target_cache_.resolved_color_rts_.empty()) {
+    render_target_cache_.resolved_color_rts_.clear();
+  }
   const ui::vulkan::VulkanDevice* const vulkan_device =
       render_target_cache_.command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -2085,6 +2115,12 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
   }
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  // The RT->texture bridge copies straight out of the render-target image, which
+  // requires transfer-source usage. Only request it when the bridge is enabled
+  // so the default path's image allocations are byte-for-byte unchanged.
+  if (REXCVAR_GET(rt_texture_bridge)) {
+    image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  }
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
@@ -6354,6 +6390,128 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
     MarkEdramBufferModified();
   }
   return all_pipelines_available;
+}
+
+void VulkanRenderTargetCache::RecordResolvedColorRT(const draw_util::ResolveInfo& resolve_info,
+                                                    bool draw_resolution_scaled) {
+  // Only the host-render-target path produces a sampleable RT image to copy from,
+  // and dump_rectangles_ is only meaningful there.
+  if (GetPath() != Path::kHostRenderTargets) {
+    return;
+  }
+  // v1 accepts only the trivially-correct case so the copy needs no coordinate
+  // math: a single full color surface at origin (0,0), scale 1, MSAA 1x, no
+  // value-altering exponent bias. Anything else is left to the normal upload.
+  if (draw_resolution_scaled || resolve_info.IsCopyingDepth()) {
+    return;
+  }
+  const draw_util::ResolveEdramInfo& color_info = resolve_info.color_edram_info;
+  if (color_info.msaa_samples != xenos::MsaaSamples::k1X) {
+    return;
+  }
+  if (resolve_info.coordinate_info.edram_offset_x_div_8 != 0 ||
+      resolve_info.coordinate_info.edram_offset_y_div_8 != 0) {
+    return;
+  }
+  if (resolve_info.copy_dest_coordinate_info.offset_x_div_8 != 0 ||
+      resolve_info.copy_dest_coordinate_info.offset_y_div_8 != 0) {
+    return;
+  }
+  if (resolve_info.copy_dest_info.copy_dest_exp_bias != 0) {
+    return;
+  }
+  // Exactly one color render target must cover the resolve so its image origin
+  // (0,0) coincides with the resolve origin.
+  if (dump_rectangles_.size() != 1) {
+    return;
+  }
+  auto* render_target = static_cast<VulkanRenderTarget*>(dump_rectangles_.front().render_target);
+  if (render_target == nullptr) {
+    return;
+  }
+  RenderTargetKey rt_key = render_target->key();
+  if (rt_key.is_depth || rt_key.msaa_samples != xenos::MsaaSamples::k1X) {
+    return;
+  }
+  // The RT must start at the resolve origin (no sub-tile offset into its image).
+  if (rt_key.base_tiles != color_info.base_tiles) {
+    return;
+  }
+  ResolvedColorRT entry;
+  entry.render_target = render_target;
+  entry.draw_generation = render_target->draw_generation();
+  entry.width = resolve_info.coordinate_info.width_div_8 * 8;
+  entry.height = resolve_info.height_div_8 * 8;
+  entry.format = GetColorVulkanFormat(rt_key.GetColorFormat());
+  resolved_color_rts_[resolve_info.copy_dest_base] = entry;
+}
+
+bool VulkanRenderTargetCache::TryBridgeResolvedColorToTexture(
+    uint32_t texture_base, uint32_t texture_width, uint32_t texture_height,
+    VkFormat texture_format, VkImage texture_image, VkPipelineStageFlags texture_cur_stage,
+    VkAccessFlags texture_cur_access, VkImageLayout texture_cur_layout) {
+  static std::atomic<uint32_t> bridge_hit{0};
+  static std::atomic<uint32_t> bridge_miss{0};
+  if (!REXCVAR_GET(rt_texture_bridge)) {
+    return false;
+  }
+  auto it = resolved_color_rts_.find(texture_base);
+  if (it == resolved_color_rts_.end()) {
+    return false;
+  }
+  const ResolvedColorRT& entry = it->second;
+  // Exact-match only: same surface size and identical host format (so the copy is
+  // bit-for-bit valid), and the RT image must not have been redrawn since the
+  // resolve (generation unchanged) — otherwise its content is stale.
+  VulkanRenderTarget* render_target = entry.render_target;
+  if (render_target == nullptr || entry.width != texture_width ||
+      entry.height != texture_height || entry.format != texture_format ||
+      render_target->draw_generation() != entry.draw_generation) {
+    uint32_t n = bridge_miss.fetch_add(1, std::memory_order_relaxed);
+    if (n < 8 || n % 512 == 0) {
+      REXGPU_WARN("[RT-BRIDGE] miss base={:08X} ({}x{}) n={}", texture_base, texture_width,
+                  texture_height, n);
+    }
+    return false;
+  }
+
+  const VkImageSubresourceRange color_range =
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
+
+  // Destination texture -> transfer destination.
+  command_processor_.PushImageMemoryBarrier(
+      texture_image, color_range, texture_cur_stage, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      texture_cur_access, VK_ACCESS_TRANSFER_WRITE_BIT, texture_cur_layout,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  // Source render target -> transfer source.
+  command_processor_.PushImageMemoryBarrier(
+      render_target->image(), color_range, render_target->current_stage_mask(),
+      VK_PIPELINE_STAGE_TRANSFER_BIT, render_target->current_access_mask(),
+      VK_ACCESS_TRANSFER_READ_BIT, render_target->current_layout(),
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  render_target->SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  command_processor_.SubmitBarriers(true);
+
+  VkImageCopy region;
+  region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  region.srcSubresource.mipLevel = 0;
+  region.srcSubresource.baseArrayLayer = 0;
+  region.srcSubresource.layerCount = 1;
+  region.srcOffset = {0, 0, 0};
+  region.dstSubresource = region.srcSubresource;
+  region.dstOffset = {0, 0, 0};
+  region.extent = {texture_width, texture_height, 1};
+  command_processor_.deferred_command_buffer().CmdVkCopyImage(
+      render_target->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture_image,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+  uint32_t n = bridge_hit.fetch_add(1, std::memory_order_relaxed);
+  if (n < 8 || n % 512 == 0) {
+    REXGPU_WARN("[RT-BRIDGE] hit base={:08X} ({}x{}) n={}", texture_base, texture_width,
+                texture_height, n);
+  }
+  return true;
 }
 
 }  // namespace rex::graphics::vulkan

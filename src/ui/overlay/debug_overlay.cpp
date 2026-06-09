@@ -37,7 +37,7 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   ImGui::SetNextWindowSize(ImVec2(280, 280), ImGuiCond_FirstUseEver);
 #else
-  ImGui::SetNextWindowSize(ImVec2(220, 60), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(300, 170), ImGuiCond_FirstUseEver);
 #endif
   ImGui::SetNextWindowBgAlpha(0.5f);
   if (ImGui::Begin("Debug##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
@@ -46,6 +46,25 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
       auto stats = stats_provider_();
       if (stats.frame_count > 0) {
         ImGui::Text("Guest: %.1f FPS (%.2f ms)", stats.fps, stats.frame_time_ms);
+      }
+      if (stats.extended) {
+        ImGui::Separator();
+        // CP frame breakdown: is the frame guest-CPU-bound (cp_wait) or draw-translation-bound
+        // (cp_exec)? Colour cp_exec red when it dominates so the bottleneck is obvious at a glance.
+        ImGui::TextUnformatted("CPU frame:");
+        ImGui::SameLine();
+        ImGui::TextColored(stats.cp_wait_ms >= stats.cp_exec_ms ? ImVec4(1, 0.6f, 0.2f, 1)
+                                                                : ImVec4(0.7f, 0.7f, 0.7f, 1),
+                           "wait %.1f", stats.cp_wait_ms);
+        ImGui::SameLine();
+        ImGui::TextColored(stats.cp_exec_ms > stats.cp_wait_ms ? ImVec4(1, 0.4f, 0.4f, 1)
+                                                               : ImVec4(0.7f, 0.7f, 0.7f, 1),
+                           "exec %.1f ms", stats.cp_exec_ms);
+        ImGui::SameLine();
+        ImGui::Text("| %.0f draws", stats.draws);
+        ImGui::Text("GPU latency: %.1f ms (max %.1f)", stats.await_avg_ms, stats.await_max_ms);
+        ImGui::Text("Streaming: %.0f tex/f  %.1f MB/f", stats.tex_count, stats.tex_mb);
+        ImGui::Text("Tex inval/f: %.0f gpu (RT)  %.0f cpu", stats.inval_gpu, stats.inval_cpu);
       }
     }
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS

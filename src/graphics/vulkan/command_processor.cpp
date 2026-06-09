@@ -13,6 +13,13 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+
+#include <rex/platform.h>  // REX_PLATFORM_WIN32 (guards the POSIX-only SIGUSR1 fbdump trigger below)
+#if !REX_PLATFORM_WIN32
+#include <csignal>
+#endif
+
+#include <rex/graphics/bo_load_probe.h>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -27,6 +34,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
+#include <rex/thread/mutex.h>  // [PERF] global-lock contention counters
 #include <rex/math.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
@@ -2282,9 +2290,336 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+// [FBLIVE] per-frame draw counter (reset each swap) -> "is the scene drawing?".
+namespace { std::atomic<uint32_t> g_blank_draws{0}; }
+
+// [BO-SHOT] On-demand one-shot frontbuffer capture — perf-free when idle. Send `kill -USR1
+// <blackops-pid>` (or tools/bo_shot.sh): the signal sets g_fbdump_request, the resolve path is
+// FORCED to copy the resolved frame back to guest RAM for the next few frames (even when
+// vulkan_readback_resolve is OFF), and IssueSwap dumps it to /tmp/wall6/fb_live.raw. Lets us
+// screenshot any moment WITHOUT leaving readback on (which inflates frame_ms in heavy scenes).
+namespace {
+std::atomic<int> g_fbdump_request{0};
+#if !REX_PLATFORM_WIN32
+void bo_fbdump_signal(int) { g_fbdump_request.store(3, std::memory_order_relaxed); }
+struct BoFbdumpInstaller {
+  BoFbdumpInstaller() { std::signal(SIGUSR1, bo_fbdump_signal); }
+};
+BoFbdumpInstaller g_bo_fbdump_installer;
+#endif  // !REX_PLATFORM_WIN32 (SIGUSR1 is POSIX-only; on Windows no signal sets g_fbdump_request)
+// True while a one-shot dump is pending; forces the resolve→guest-RAM copy for that frame.
+inline bool bo_fbdump_pending() { return g_fbdump_request.load(std::memory_order_relaxed) > 0; }
+}  // namespace
+// [BO-LOAD] counter definitions live in src/graphics/bo_load_probe.cpp (global scope) — they
+// can't be defined here because this TU is inside namespace rex::graphics::vulkan.
+
+// [PERF] critical-path probe (env BO_PERF=1). All CPU<->GPU blocking funnels through
+// CheckSubmissionFenceAndDeviceLoss; we count calls and sum the ticks spent in the
+// UINT64_MAX vkWaitForFences (the true stall). IssueSwap logs a per-frame breakdown.
+namespace {
+std::atomic<uint32_t> g_perf_await_calls{0};
+std::atomic<uint32_t> g_perf_await_block_calls{0};
+std::atomic<uint64_t> g_perf_await_block_ticks{0};
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  // Per-frame draw count, captured+reset ONCE here so [PERF], [FBLIVE] and [BO-SCENE] all see
+  // the same value (previously [PERF] and [FBLIVE] each exchanged it, splitting the count).
+  uint32_t draws_now = g_blank_draws.exchange(0);
+  {  // [FPS] cheap always-on render-rate log (no disk). Logs presented swaps/sec ~every 2s.
+    static std::atomic<uint32_t> frames{0};
+    static std::atomic<int64_t> last_ns{0};
+    frames.fetch_add(1);
+    int64_t now = int64_t(rex::chrono::Clock::QueryHostTickCount());
+    int64_t freq = int64_t(rex::chrono::Clock::QueryHostTickFrequency());
+    int64_t prev = last_ns.load();
+    if (prev == 0) { last_ns.store(now); }
+    else if (now - prev >= freq * 2) {
+      if (last_ns.compare_exchange_strong(prev, now)) {
+        uint32_t f = frames.exchange(0);
+        REXGPU_WARN("[FPS] {} render fps", uint32_t(double(f) * freq / double(now - prev)));
+      }
+    }
+  }
+  {  // [PERF] per-frame critical-path breakdown. Accumulated + averaged over 30 frames ALWAYS
+     // (cheap — a few atomic exchanges/swap) so the F3 debug overlay can read it via bo_load::g_hud.
+     // The [PERF]/[BO-DRAW] LOG lines + glock caller dump are gated behind env BO_PERF=1; the
+     // overlay snapshot publish is unconditional.
+    static const bool kPerf = std::getenv("BO_PERF") != nullptr;
+    {
+      static int64_t s_last_swap = 0;
+      static uint64_t s_last_sub = 0;
+      static double s_acc_frame = 0.0, s_acc_await = 0.0, s_max_await = 0.0;
+      static uint32_t s_acc_calls = 0, s_acc_blk = 0, s_n = 0;
+      int64_t fnow = int64_t(rex::chrono::Clock::QueryHostTickCount());
+      int64_t ffreq = int64_t(rex::chrono::Clock::QueryHostTickFrequency());
+      double frame_ms = s_last_swap ? double(fnow - s_last_swap) * 1000.0 / double(ffreq) : 0.0;
+      s_last_swap = fnow;
+      uint32_t calls = g_perf_await_calls.exchange(0);
+      uint32_t blk = g_perf_await_block_calls.exchange(0);
+      double await_ms = double(g_perf_await_block_ticks.exchange(0)) * 1000.0 / double(ffreq);
+      uint64_t cur_sub = GetCurrentSubmission();
+      uint32_t subs = uint32_t(cur_sub - s_last_sub);
+      s_last_sub = cur_sub;
+      uint32_t fif = uint32_t(submissions_in_flight_fences_.size());
+      uint32_t draws = draws_now;
+      // [PERF] global-lock contention since last swap.
+      uint64_t glock_acq = rex::thread::global_critical_region::PerfAcquires();
+      double glock_wait_ms =
+          double(rex::thread::global_critical_region::PerfWaitTicks()) * 1000.0 / double(ffreq);
+      static uint64_t s_acc_glock_acq = 0;
+      static double s_acc_glock_wait = 0.0;
+      // [BO-CP] CP-thread frame split: waiting for guest ring data vs executing it.
+      double cp_wait_ms = double(rex::graphics::bo_load::cp_wait_ns.exchange(0)) * 1e-6;
+      double cp_exec_ms = double(rex::graphics::bo_load::cp_exec_ns.exchange(0)) * 1e-6;
+      double cp_tex_ms = double(rex::graphics::bo_load::cp_texreq_ns.exchange(0)) * 1e-6;
+      double draw_rt_ms = double(rex::graphics::bo_load::draw_rt_ns.exchange(0)) * 1e-6;
+      double draw_pipe_ms = double(rex::graphics::bo_load::draw_pipeline_ns.exchange(0)) * 1e-6;
+      double draw_bind_ms = double(rex::graphics::bo_load::draw_bindings_ns.exchange(0)) * 1e-6;
+      double draw_total_ms = double(rex::graphics::bo_load::draw_total_ns.exchange(0)) * 1e-6;
+      double draw_sc_ms = double(rex::graphics::bo_load::draw_sysconst_ns.exchange(0)) * 1e-6;
+      double draw_vp_ms = double(rex::graphics::bo_load::draw_viewport_ns.exchange(0)) * 1e-6;
+      double draw_pr_ms = double(rex::graphics::bo_load::draw_prim_ns.exchange(0)) * 1e-6;
+      double draw_setup_ms = double(rex::graphics::bo_load::draw_setup_ns.exchange(0)) * 1e-6;
+      double draw_shsamp_ms = double(rex::graphics::bo_load::draw_shsamp_ns.exchange(0)) * 1e-6;
+      double draw_record_ms = double(rex::graphics::bo_load::draw_record_ns.exchange(0)) * 1e-6;
+      double draw_drawcmd_ms = double(rex::graphics::bo_load::draw_drawcmd_ns.exchange(0)) * 1e-6;
+      double draw_vkcmd_ms = double(rex::graphics::bo_load::draw_vkcmd_ns.exchange(0)) * 1e-6;
+      uint32_t vf_seen = rex::graphics::bo_load::vfetch_seen.exchange(0);
+      uint32_t vf_bitsync = rex::graphics::bo_load::vfetch_bitsync.exchange(0);
+      uint32_t vf_request = rex::graphics::bo_load::vfetch_request.exchange(0);
+      double draw_vfloop_ms = double(rex::graphics::bo_load::draw_vfetchloop_ns.exchange(0)) * 1e-6;
+      uint32_t rr_fast = rex::graphics::bo_load::reqrange_fast.exchange(0);
+      uint32_t rr_full = rex::graphics::bo_load::reqrange_full.exchange(0);
+      static double s_acc_cp_wait = 0.0, s_acc_cp_exec = 0.0, s_acc_cp_tex = 0.0;
+      static double s_acc_rt = 0.0, s_acc_pipe = 0.0, s_acc_bind = 0.0, s_acc_draw = 0.0;
+      static double s_acc_sc = 0.0, s_acc_vp = 0.0, s_acc_pr = 0.0;
+      static double s_acc_setup = 0.0, s_acc_shsamp = 0.0, s_acc_record = 0.0, s_acc_drawcmd = 0.0;
+      static double s_acc_vkcmd = 0.0;
+      static uint64_t s_acc_vf_seen = 0, s_acc_vf_bitsync = 0, s_acc_vf_request = 0;
+      static double s_acc_vfloop = 0.0; static uint64_t s_acc_rr_fast = 0, s_acc_rr_full = 0;
+      s_acc_cp_wait += cp_wait_ms;
+      s_acc_cp_exec += cp_exec_ms;
+      s_acc_cp_tex += cp_tex_ms;
+      s_acc_rt += draw_rt_ms;
+      s_acc_pipe += draw_pipe_ms;
+      s_acc_bind += draw_bind_ms;
+      s_acc_draw += draw_total_ms;
+      s_acc_sc += draw_sc_ms;
+      s_acc_vp += draw_vp_ms;
+      s_acc_pr += draw_pr_ms;
+      s_acc_setup += draw_setup_ms;
+      s_acc_shsamp += draw_shsamp_ms;
+      s_acc_record += draw_record_ms;
+      s_acc_drawcmd += draw_drawcmd_ms;
+      s_acc_vkcmd += draw_vkcmd_ms;
+      s_acc_vf_seen += vf_seen;
+      s_acc_vf_bitsync += vf_bitsync;
+      s_acc_vf_request += vf_request;
+      s_acc_vfloop += draw_vfloop_ms;
+      s_acc_rr_fast += rr_fast;
+      s_acc_rr_full += rr_full;
+      s_acc_frame += frame_ms;
+      s_acc_await += await_ms;
+      if (await_ms > s_max_await) s_max_await = await_ms;
+      s_acc_calls += calls;
+      s_acc_blk += blk;
+      s_acc_glock_acq += glock_acq;
+      s_acc_glock_wait += glock_wait_ms;
+      if (++s_n >= 30) {
+        // Publish the 30-frame snapshot to the F3 overlay (always; see g_hud). cp/await/frame/draws
+        // here; the texture-streaming fields are published from the [BO-LOAD] block below.
+        {
+          namespace bl = rex::graphics::bo_load;
+          bl::g_hud.frame_ms.store(float(s_acc_frame / s_n), std::memory_order_relaxed);
+          bl::g_hud.cp_wait_ms.store(float(s_acc_cp_wait / s_n), std::memory_order_relaxed);
+          bl::g_hud.cp_exec_ms.store(float(s_acc_cp_exec / s_n), std::memory_order_relaxed);
+          bl::g_hud.await_avg_ms.store(float(s_acc_await / s_n), std::memory_order_relaxed);
+          bl::g_hud.await_max_ms.store(float(s_max_await), std::memory_order_relaxed);
+          bl::g_hud.draws.store(float(draws), std::memory_order_relaxed);
+          bl::g_hud.updates.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (kPerf) {
+          REXGPU_WARN(
+              "[PERF] frame_ms={:.2f} cp_wait_ms/f={:.2f} cp_exec_ms/f={:.2f} (tex {:.2f}) "
+              "await_block_ms={:.2f}(max {:.2f}) glock_acq/f={} glock_wait_ms/f={:.2f} calls/f={:.1f} "
+              "blocked/f={:.1f} subs/f={} fif={} draws={}",
+              s_acc_frame / s_n, s_acc_cp_wait / s_n, s_acc_cp_exec / s_n, s_acc_cp_tex / s_n,
+              s_acc_await / s_n, s_max_await, s_acc_glock_acq / s_n, s_acc_glock_wait / s_n,
+              double(s_acc_calls) / s_n, double(s_acc_blk) / s_n, subs, fif, draws);
+          double other = (s_acc_draw - s_acc_rt - s_acc_pipe - s_acc_bind - s_acc_cp_tex - s_acc_sc -
+                          s_acc_vp - s_acc_pr - s_acc_setup - s_acc_shsamp - s_acc_record) / s_n;
+          REXGPU_WARN("[BO-DRAW] IssueDraw={:.2f}ms [rt={:.2f} pipe={:.2f} bind={:.2f} tex={:.2f} "
+                      "sysconst={:.2f} viewport={:.2f} prim={:.2f} other={:.2f}] packet_parse={:.2f}ms "
+                      "(cp_exec={:.2f}ms, {} draws)",
+                      s_acc_draw / s_n, s_acc_rt / s_n, s_acc_pipe / s_n, s_acc_bind / s_n,
+                      s_acc_cp_tex / s_n, s_acc_sc / s_n, s_acc_vp / s_n, s_acc_pr / s_n, other,
+                      (s_acc_cp_exec - s_acc_draw) / s_n, s_acc_cp_exec / s_n, draws);
+          // [BO-DRAW2] the previously-untimed spans, now bisected (per frame, 30-frame avg).
+          REXGPU_WARN("[BO-DRAW2] untimed-split: setup={:.2f} shader+sampler={:.2f} "
+                      "residency+record={:.2f} (of which barriers+drawcmd={:.2f}, residency={:.2f}) "
+                      "other={:.2f} ms/frame ({} draws)",
+                      s_acc_setup / s_n, s_acc_shsamp / s_n, s_acc_record / s_n, s_acc_drawcmd / s_n,
+                      (s_acc_record - s_acc_drawcmd) / s_n, other, draws);
+          // [BO-DRAW3] the two halves of the hotspot, sub-bisected.
+          REXGPU_WARN("[BO-DRAW3] drawcmd={:.2f}ms (SubmitBarriers={:.2f} + vkCmd-record={:.2f}) | "
+                      "vfetch/f: seen={} bitsync={} request={} ({}% bitsync, {} real-RequestRange)",
+                      s_acc_drawcmd / s_n, (s_acc_drawcmd - s_acc_vkcmd) / s_n, s_acc_vkcmd / s_n,
+                      s_acc_vf_seen / s_n, s_acc_vf_bitsync / s_n, s_acc_vf_request / s_n,
+                      s_acc_vf_seen ? (100 * s_acc_vf_bitsync / s_acc_vf_seen) : 0,
+                      s_acc_vf_request / s_n);
+          // [BO-DRAW4] vfetch loop time + RequestRange fast/full split (does the all-valid
+          // fast path actually fire, or are buffers genuinely re-uploading each frame?).
+          REXGPU_WARN("[BO-DRAW4] vfetch_loop={:.2f}ms/f | RequestRange/f: fast(resident)={} "
+                      "full(upload-path)={} ({}% resident)",
+                      s_acc_vfloop / s_n, s_acc_rr_fast / s_n, s_acc_rr_full / s_n,
+                      (s_acc_rr_fast + s_acc_rr_full)
+                          ? (100 * s_acc_rr_fast / (s_acc_rr_fast + s_acc_rr_full))
+                          : 0);
+        }
+        s_acc_frame = 0.0; s_acc_await = 0.0; s_max_await = 0.0;
+        s_acc_calls = 0; s_acc_blk = 0; s_n = 0;
+        s_acc_glock_acq = 0; s_acc_glock_wait = 0.0;
+        s_acc_cp_wait = 0.0; s_acc_cp_exec = 0.0; s_acc_cp_tex = 0.0;
+        s_acc_rt = 0.0; s_acc_pipe = 0.0; s_acc_bind = 0.0; s_acc_draw = 0.0;
+        s_acc_sc = 0.0; s_acc_vp = 0.0; s_acc_pr = 0.0;
+        s_acc_setup = 0.0; s_acc_shsamp = 0.0; s_acc_record = 0.0; s_acc_drawcmd = 0.0;
+        s_acc_vkcmd = 0.0; s_acc_vf_seen = 0; s_acc_vf_bitsync = 0; s_acc_vf_request = 0;
+        s_acc_vfloop = 0.0; s_acc_rr_fast = 0; s_acc_rr_full = 0;
+        // [GLOCK PROF] dump the top global-lock callers every ~5 reports (log-only).
+        if (kPerf) {
+          static uint32_t s_dump = 0;
+          if (++s_dump % 5 == 0) {
+            rex::thread::global_critical_region::PerfDumpCallers();
+          }
+        }
+      }
+    }
+  }
+  {  // [BO-BRIGHT] per-FRAME blown-white counter (needs readback) — dense, no sampling gap, to
+     // rigorously A/B the video blowout. Counts frames whose sparse sample is >=80% near-white.
+    static const bool kBright = std::getenv("BO_BRIGHT") != nullptr;
+    if (kBright && memory_) {
+      const uint8_t* hp = memory_->TranslatePhysical(frontbuffer_ptr);
+      if (hp) {
+        size_t px = size_t(frontbuffer_width) * frontbuffer_height;
+        const uint32_t* p = reinterpret_cast<const uint32_t*>(hp);
+        uint32_t bright = 0, samples = 0;
+        for (size_t i = 0; i < px; i += 97) {
+          uint32_t v = p[i]; uint8_t r = v & 0xFF, g = (v >> 8) & 0xFF, b = (v >> 16) & 0xFF;
+          if (r > 0xC0 && g > 0xC0 && b > 0xC0) ++bright; ++samples;
+        }
+        static uint32_t s_frames = 0, s_blown = 0;
+        ++s_frames;
+        if (samples && 100 * bright / samples >= 80) ++s_blown;
+        if ((s_frames % 120) == 0) {
+          REXGPU_WARN("[BO-BRIGHT] blown={} / frames={} ({}%)", s_blown, s_frames,
+                      s_frames ? 100 * s_blown / s_frames : 0);
+        }
+      }
+    }
+  }
+  // [FBLIVE]/[BO-SHOT] frontbuffer capture. Continuous when BO_FBDUMP=1 (every 15th swap);
+  // on-demand ALWAYS via `kill -USR1` (g_fbdump_request), which also forces the resolve→guest
+  // copy above so the dump is valid even with vulkan_readback_resolve OFF. Dumps the
+  // frontbuffer to /tmp/wall6/fb_live.raw + logs a color summary (untile w/ tools/untile.py).
+  {
+    static const bool kFbDump = std::getenv("BO_FBDUMP") != nullptr;
+    static std::atomic<uint32_t> s_sw{0};
+    uint32_t n = s_sw.fetch_add(1);
+    int req = g_fbdump_request.load(std::memory_order_relaxed);
+    bool want = (kFbDump && (n % 15) == 0) || req > 0;
+    if (want && memory_) {
+      const uint8_t* hp = memory_->TranslatePhysical(frontbuffer_ptr);
+      if (hp) {
+        size_t px = size_t(frontbuffer_width) * frontbuffer_height;
+        FILE* f = std::fopen("/tmp/wall6/fb_live.raw", "wb");
+        if (f) { std::fwrite(hp, 4, px, f); std::fclose(f); }
+        const uint32_t* p = reinterpret_cast<const uint32_t*>(hp);
+        uint32_t bright = 0; uint64_t sr = 0, sg = 0, sb = 0; uint32_t samples = 0;
+        for (size_t i = 0; i < px; i += 97) {  // sparse sample
+          uint32_t v = p[i]; uint8_t r = v & 0xFF, g = (v >> 8) & 0xFF, b = (v >> 16) & 0xFF;
+          sr += r; sg += g; sb += b;
+          if (r > 0xC0 && g > 0xC0 && b > 0xC0) ++bright; ++samples;
+        }
+        if (samples)
+          REXGPU_WARN("[FBLIVE] swap#{} fb=0x{:08X} mean=({},{},{}) bright%={} draws={}{}",
+                      n, frontbuffer_ptr, uint32_t(sr / samples), uint32_t(sg / samples),
+                      uint32_t(sb / samples), 100 * bright / samples, draws_now,
+                      req > 0 ? " [BO-SHOT one-shot -> /tmp/wall6/fb_live.raw]" : "");
+      }
+    }
+    if (req > 0) g_fbdump_request.fetch_sub(1, std::memory_order_relaxed);
+  }
+  {  // [BO-SCENE] cheap scene fingerprint for closed-loop nav (always on; opt out w/ BO_NOSCENE).
+     // Emits one line only when the scene CATEGORY changes (by draw count — a proven nav signal:
+     // load/2d<200, cinematic<1600, menu/light<2200, heavy/combat≥2200) or fe_state moves, so a
+     // script can wait on a real transition (bo_key.py --until) instead of guessing sleeps. The
+     // category (not the raw draw count) is the trigger to avoid per-frame spam from jitter.
+    static const bool kScene = std::getenv("BO_NOSCENE") == nullptr;
+    if (kScene && memory_) {
+      const uint8_t* fe_hp = memory_->TranslateVirtual<const uint8_t*>(0x83147768u);
+      uint32_t fe = 0; if (fe_hp) std::memcpy(&fe, fe_hp, 4); fe = __builtin_bswap32(fe);
+      const char* scene = draws_now < 200 ? "loading/2d"
+                        : draws_now < 1600 ? "cinematic"
+                        : draws_now < 2200 ? "menu/light"
+                                           : "heavy/combat";
+      static const char* s_scene = nullptr;
+      static uint32_t s_fe = 0xFFFFFFFFu;
+      if (scene != s_scene || fe != s_fe) {  // s_scene compares the literal pointer (stable)
+        s_scene = scene; s_fe = fe;
+        REXGPU_WARN("[BO-SCENE] scene={} draws={} fe_state={}", scene, draws_now, fe);
+      }
+    }
+  }
+  {  // [BO-LOAD] mission-load breakdown (always on; opt out BO_NOSCENE=1). Per-frame deltas of
+     // cache-MISS pipeline compiles / shader translations / texture uploads — the work behind the
+     // "freeze then it plays" hitch — logged only while active, plus a totals line when it settles.
+     // This separates shader-cache misses (compile) from texture streaming (uploads).
+    static const bool kLoad = std::getenv("BO_NOSCENE") == nullptr;
+    if (kLoad) {
+      namespace bl = rex::graphics::bo_load;
+      uint32_t pc = bl::pipelines_created.exchange(0, std::memory_order_relaxed);
+      double pc_ms = double(bl::pipeline_compile_ns.exchange(0, std::memory_order_relaxed)) * 1e-6;
+      uint32_t sx = bl::shaders_translated.exchange(0, std::memory_order_relaxed);
+      double sx_ms = double(bl::shader_translate_ns.exchange(0, std::memory_order_relaxed)) * 1e-6;
+      uint32_t tx = bl::textures_uploaded.exchange(0, std::memory_order_relaxed);
+      double tx_mb = double(bl::texture_upload_bytes.exchange(0, std::memory_order_relaxed)) / 1048576.0;
+      double tx_ms = double(bl::texture_upload_ns.exchange(0, std::memory_order_relaxed)) * 1e-6;
+      uint32_t iv_gpu = bl::tex_inval_gpu.exchange(0, std::memory_order_relaxed);
+      uint32_t iv_cpu = bl::tex_inval_cpu.exchange(0, std::memory_order_relaxed);
+      // Publish smoothed streaming rates to the F3 overlay (EMA so the readout doesn't flicker
+      // between idle/burst frames; these are display-only).
+      auto ema = [](std::atomic<float>& a, float v) {
+        a.store(a.load(std::memory_order_relaxed) * 0.9f + v * 0.1f, std::memory_order_relaxed);
+      };
+      ema(bl::g_hud.tex_count, float(tx));
+      ema(bl::g_hud.tex_mb, float(tx_mb));
+      ema(bl::g_hud.inval_gpu, float(iv_gpu));
+      ema(bl::g_hud.inval_cpu, float(iv_cpu));
+      static uint32_t t_pc = 0, t_sx = 0, t_tx = 0;
+      static double t_pc_ms = 0.0, t_sx_ms = 0.0, t_tx_mb = 0.0;
+      static uint32_t s_idle = 0;
+      bool active = (pc | sx | tx) != 0;
+      if (active) {
+        t_pc += pc; t_sx += sx; t_tx += tx; t_pc_ms += pc_ms; t_sx_ms += sx_ms; t_tx_mb += tx_mb;
+        s_idle = 0;
+        REXGPU_WARN("[BO-LOAD] frame_ms~ +pipelines={} ({:.1f}ms) +shaders={} ({:.1f}ms) "
+                    "+textures={} ({:.2f}MB, {:.1f}ms cpu) inval[gpu={} cpu={}]  draws={}",
+                    pc, pc_ms, sx, sx_ms, tx, tx_mb, tx_ms, iv_gpu, iv_cpu, draws_now);
+      } else if (t_pc || t_sx || t_tx) {
+        // Activity stopped — emit the load total once (after a few idle frames to coalesce bursts).
+        if (++s_idle >= 8) {
+          REXGPU_WARN("[BO-LOAD] === settled: pipelines={} (compile {:.1f}ms) shaders={} "
+                      "(translate {:.1f}ms) textures={} ({:.1f}MB) ===",
+                      t_pc, t_pc_ms, t_sx, t_sx_ms, t_tx, t_tx_mb);
+          t_pc = t_sx = t_tx = 0; t_pc_ms = t_sx_ms = 0.0; t_tx_mb = 0.0; s_idle = 0;
+        }
+      }
+    }
+  }
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -3607,6 +3942,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  g_blank_draws.fetch_add(1);  // [FBLIVE] per-frame draw count
+  // [BO-DRAW] time the whole IssueDraw; cp_exec minus this = PM4 packet parsing / register writes.
+  rex::graphics::bo_load::ScopedTally _bo_draw(nullptr, &rex::graphics::bo_load::draw_total_ns);
+  // [BO-DRAW2] bisect the untimed IssueDraw "other" via manual steady_clock timestamps (see below).
+  namespace bl = rex::graphics::bo_load;
+  auto _accum = [](std::atomic<uint64_t>& a, std::chrono::steady_clock::time_point t0) {
+    a.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count()),
+                std::memory_order_relaxed);
+  };
+  auto _t_setup = std::chrono::steady_clock::now();
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
   auto draw_fail = [&](const char* stage) {
@@ -3715,13 +4062,20 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // updates done previously must be performed again because the updates done
   // before the awaiting may be referencing objects destroyed by
   // CompletedSubmissionUpdated.
+  _accum(bl::draw_setup_ns, _t_setup);  // [BO-DRAW2] setup span done (fn top -> loop)
   for (uint32_t i = 0; i < 2; ++i) {
     if (!BeginSubmission(true)) {
       return draw_fail("begin_submission");
     }
 
     // Process primitives.
-    if (!primitive_processor_->Process(primitive_processing_result)) {
+    bool prim_ok;
+    {  // [BO-DRAW] primitive processing (index conversion/build).
+      rex::graphics::bo_load::ScopedTally _bo_prim(nullptr, &rex::graphics::bo_load::draw_prim_ns);
+      prim_ok = primitive_processor_->Process(primitive_processing_result);
+    }
+    auto _t_sh = std::chrono::steady_clock::now();  // [BO-DRAW2] shader-xlate + sampler span start
+    if (!prim_ok) {
       return draw_fail("primitive_processing");
     }
     if (!primitive_processing_result.host_draw_vertex_count) {
@@ -3822,6 +4176,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         }
       }
     }
+    _accum(bl::draw_shsamp_ns, _t_sh);  // [BO-DRAW2] shader-xlate + sampler span done
     if (!samplers_overflowed_count) {
       break;
     }
@@ -3852,8 +4207,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
-                                    normalized_color_mask, *vertex_shader)) {
+  bool rt_update_ok;
+  {  // [BO-DRAW] render-target setup phase.
+    rex::graphics::bo_load::ScopedTally _bo_rt(nullptr, &rex::graphics::bo_load::draw_rt_ns);
+    rt_update_ok = render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                                normalized_color_mask, *vertex_shader);
+  }
+  if (!rt_update_ok) {
     return draw_fail("render_target_update");
   }
 
@@ -3862,11 +4222,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // textures.
   VkPipeline pipeline;
   void* pipeline_handle = nullptr;
-  if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
-                                          primitive_processing_result, normalized_depth_control,
-                                          normalized_color_mask,
-                                          render_target_cache_->last_update_render_pass_key(),
-                                          pipeline, pipeline_layout_provider, &pipeline_handle)) {
+  bool configure_ok;
+  {  // [BO-DRAW] pipeline configure/lookup/translate phase.
+    rex::graphics::bo_load::ScopedTally _bo_pipe(nullptr, &rex::graphics::bo_load::draw_pipeline_ns);
+    configure_ok = pipeline_cache_->ConfigurePipeline(
+        vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
+        normalized_depth_control, normalized_color_mask,
+        render_target_cache_->last_update_render_pass_key(), pipeline, pipeline_layout_provider,
+        &pipeline_handle);
+  }
+  if (!configure_ok) {
     return draw_fail("configure_pipeline");
   }
   bool pipeline_is_placeholder = false;
@@ -3938,15 +4303,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // life. Or even disregard the viewport bounds range in the fragment shader
   // interlocks case completely - apply the viewport and the scissor offset
   // directly to pixel address and to things like ps_param_gen.
-  draw_util::GetHostViewportInfo(
-      regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
-      device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
-      normalized_depth_control,
-      host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
-      host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
+  {  // [BO-DRAW] viewport computation + dynamic state.
+    rex::graphics::bo_load::ScopedTally _bo_vp(nullptr, &rex::graphics::bo_load::draw_viewport_ns);
+    draw_util::GetHostViewportInfo(
+        regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
+        device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
+        normalized_depth_control,
+        host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
+        host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
 
-  // Update dynamic graphics pipeline state.
-  UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
+    // Update dynamic graphics pipeline state.
+    UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
+  }
 
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
 
@@ -3980,18 +4348,35 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   // Update system constants before uploading them.
-  UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
-                             shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
-                             normalized_depth_control, normalized_color_mask);
+  {  // [BO-DRAW] system-constant recomputation.
+    rex::graphics::bo_load::ScopedTally _bo_sc(nullptr, &rex::graphics::bo_load::draw_sysconst_ns);
+    UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
+                               shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
+                               normalized_depth_control, normalized_color_mask);
+  }
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
-  if (!UpdateBindings(vertex_shader, pixel_shader)) {
+  bool bindings_ok;
+  {  // [BO-DRAW] descriptor-set + uniform-buffer update phase.
+    rex::graphics::bo_load::ScopedTally _bo_bind(nullptr, &rex::graphics::bo_load::draw_bindings_ns);
+    bindings_ok = UpdateBindings(vertex_shader, pixel_shader);
+  }
+  if (!bindings_ok) {
     return draw_fail("update_bindings");
   }
+  auto _t_rec = std::chrono::steady_clock::now();  // [BO-DRAW2] residency + barriers + draw-record span
 
-  // Ensure vertex buffers are resident.
+  // Ensure vertex buffers are resident. [BO-PERF] Collect the ranges that actually need a
+  // residency request and issue them as ONE batched RequestRanges after the loop instead of
+  // a separate RequestRange per fetch slot. RequestRanges merges adjacent/overlapping buffers
+  // and acquires the shared-memory global lock + allocates the merge vector once per draw rather
+  // than once per vertex buffer (the upstream per-slot call pattern). vertex_buffer_states_ holds
+  // 96 slots, so at most 96 ranges. Cache bits/states are set as ranges are collected; a
+  // RequestRanges failure is fatal (out-of-bounds range) and fails the whole draw, same as before.
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+  std::array<std::pair<uint32_t, uint32_t>, 96> vfetch_request_ranges;
+  uint32_t vfetch_request_count = 0;
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
     uint32_t j;
@@ -3999,7 +4384,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       vfetch_bits_remaining &= ~(uint32_t(1) << j);
       uint32_t vfetch_index = i * 32 + j;
       uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
+      bl::vfetch_seen.fetch_add(1, std::memory_order_relaxed);  // [BO-DRAW2]
       if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
+        bl::vfetch_bitsync.fetch_add(1, std::memory_order_relaxed);  // [BO-DRAW2]
         continue;
       }
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
@@ -4027,18 +4414,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
-        REXGPU_ERROR(
-            "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
-            "memory",
-            vfetch_constant.address << 2, vfetch_constant.size << 2);
-        return false;
-      }
+      bl::vfetch_request.fetch_add(1, std::memory_order_relaxed);  // [BO-DRAW2]
+      vfetch_request_ranges[vfetch_request_count++] = {vfetch_constant.address << 2,
+                                                       vfetch_constant.size << 2};
       state.address = vfetch_constant.address;
       state.size = vfetch_constant.size;
       vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
     }
   }
+  if (vfetch_request_count &&
+      !shared_memory_->RequestRanges(vfetch_request_ranges.data(), vfetch_request_count)) {
+    REXGPU_ERROR("Failed to request {} vertex buffer range(s) in the shared memory",
+                 vfetch_request_count);
+    return false;
+  }
+  _accum(bl::draw_vfetchloop_ns, _t_rec);  // [BO-DRAW4] just the vfetch residency loop
 
   // Synchronize the memory pages backing memory scatter export streams, and
   // calculate the range that includes the streams for the buffer barrier.
@@ -4121,6 +4511,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   }
 
+  auto _t_draw = std::chrono::steady_clock::now();  // [BO-DRAW2] barriers + render-pass + draw-record
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
   // before drawing.
@@ -4129,6 +4520,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       render_target_cache_->last_update_framebuffer());
 
   // Draw.
+  auto _t_cmd = std::chrono::steady_clock::now();  // [BO-DRAW2] just the vkCmd recording sub-span
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
@@ -4194,6 +4586,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
+  _accum(bl::draw_record_ns, _t_rec);     // [BO-DRAW2] full residency+record span done
+  _accum(bl::draw_drawcmd_ns, _t_draw);   // [BO-DRAW2] barriers + render-pass + draw-record sub-span
+  _accum(bl::draw_vkcmd_ns, _t_cmd);      // [BO-DRAW2] just the vkCmd recording (drawcmd - this = SubmitBarriers)
   return true;
 }
 
@@ -4403,7 +4798,9 @@ bool VulkanCommandProcessor::IssueCopy() {
     return false;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  // [BO-SHOT] force the readback copy for one-shot frontbuffer dumps (see g_fbdump_request).
+  ReadbackResolveMode readback_mode =
+      GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve) || bo_fbdump_pending());
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
@@ -4432,7 +4829,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  ReadbackResolveMode readback_mode =
+      GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve) || bo_fbdump_pending());
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     return true;
   }
@@ -4981,6 +5379,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   if (device_lost_) {
     return;
   }
+  g_perf_await_calls.fetch_add(1, std::memory_order_relaxed);  // [PERF]
 
   if (await_submission >= GetCurrentSubmission()) {
     if (submission_open_) {
@@ -5003,9 +5402,14 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
+    int64_t perf_wt0 = int64_t(rex::chrono::Clock::QueryHostTickCount());  // [PERF]
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    g_perf_await_block_calls.fetch_add(1, std::memory_order_relaxed);  // [PERF]
+    g_perf_await_block_ticks.fetch_add(
+        uint64_t(int64_t(rex::chrono::Clock::QueryHostTickCount()) - perf_wt0),
+        std::memory_order_relaxed);
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {

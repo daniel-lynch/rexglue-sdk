@@ -86,11 +86,13 @@ extern "C" int main(int argc_pre_gtk, char** argv_pre_gtk) {
       result = EXIT_FAILURE;
     }
 
-    app->InvokeOnDestroy();
+    // InvokeOnDestroy() joins the module thread, which can hang indefinitely
+    // when GPU threads are blocked on Vulkan fences after window close.
+    // Flush logs and force-exit; the OS releases all resources.
+    rex::ShutdownLogging();
+    _exit(result);
   }
 
-  // Logging may still be needed in the destructors.
   rex::ShutdownLogging();
-
   return result;
 }

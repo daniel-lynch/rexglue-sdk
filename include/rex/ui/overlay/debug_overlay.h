@@ -21,6 +21,18 @@ struct FrameStats {
   double frame_time_ms = 0;
   double fps = 0;
   uint64_t frame_count = 0;
+  // Extended [BO-*] perf metrics for the overlay (populated by the rexglue stats provider when
+  // `extended` is true). All are recent averages; see graphics/bo_load_probe.h HudSnapshot.
+  bool extended = false;
+  double cp_wait_ms = 0;    // CP idle waiting on guest ring (guest-CPU-bound signal)
+  double cp_exec_ms = 0;    // CP translating ring -> Vulkan (draw-translation-bound)
+  double await_avg_ms = 0;  // GPU fence wait per frame (avg)
+  double await_max_ms = 0;  // GPU fence wait recent max (texture-reveal stall spikes)
+  double tex_mb = 0;        // texture MB uploaded per frame (streaming)
+  double tex_count = 0;     // textures uploaded per frame
+  double inval_gpu = 0;     // texture invalidations from GPU resolves/frame (RT thrash)
+  double inval_cpu = 0;     // texture invalidations from CPU/guest writes/frame
+  double draws = 0;         // draw calls per frame
 };
 
 class DebugOverlayDialog : public ImGuiDialog {

@@ -147,6 +147,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
                           std::vector<uint32_t>& spirv_out, std::string& error_out) const;
 
+  // The host render target cache for the currently active path. May be used by
+  // the texture cache to bridge resolved render targets directly into textures.
+  VulkanRenderTargetCache* render_target_cache() const { return render_target_cache_.get(); }
+
   // Returns the deferred drawing command list for the currently open
   // submission.
   DeferredCommandBuffer& deferred_command_buffer() {
@@ -590,9 +594,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unordered_map<PipelineLayoutKey, PipelineLayout, PipelineLayoutKey::Hasher>
       pipeline_layouts_;
 
-  // No specific reason for 32768, just the "too much" descriptor count from
-  // Direct3D 12 PIX warnings.
-  static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 32768;
+  // Per-page descriptor set count for the transient descriptor allocators. The
+  // allocator spills to additional pool pages on demand, so this only needs to be
+  // a reasonable batch size. It MUST stay modest: it scales maxSets and every
+  // per-type descriptorCount of each VkDescriptorPool, and an oversized value
+  // (the original 32768, inherited from a D3D12 PIX warning) makes the first
+  // vkCreateDescriptorPool reserve hundreds of MB up front and hang the NVIDIA
+  // driver. 256 matches upstream Xenia.
+  static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 256;
   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];

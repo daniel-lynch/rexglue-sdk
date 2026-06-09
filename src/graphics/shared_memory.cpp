@@ -16,6 +16,7 @@
 #include <rex/assert.h>
 #include <rex/bit.h>
 #include <rex/dbg.h>
+#include <rex/graphics/bo_load_probe.h>  // [BO-DRAW4] RequestRange fast-path counters
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
@@ -574,6 +575,44 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+  // [BO-PERF] Fast path for a single already-resident range. The hot caller is the
+  // per-draw vertex-buffer residency loop, which re-validates every bound buffer once
+  // per frame (the residency bitmap is wiped each swap). In a static scene almost all of
+  // those buffers are already uploaded, so the full RequestRanges path needlessly
+  // heap-allocates the merged-ranges vector and runs EnsureHostGpuMemoryAllocated before
+  // reaching the identical lockless all-valid check. Do that check inline here with zero
+  // allocation: if every page in the range is valid we're done (a valid range is, by
+  // construction, already sparse-allocated and uploaded). Otherwise fall through to the
+  // unchanged full path. Mirrors the all_valid scan in RequestRanges.
+  if (length && start <= kBufferSize && (kBufferSize - start) >= length) {
+    uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_acquire);
+    if (valid_flags) {
+      uint32_t page_first = start >> page_size_log2_;
+      uint32_t page_last = (start + length - 1) >> page_size_log2_;
+      uint32_t block_first = page_first >> 6;
+      uint32_t block_last = page_last >> 6;
+      bool all_valid = true;
+      for (uint32_t i = block_first; i <= block_last; ++i) {
+        uint64_t block_valid = valid_flags[i];
+        // Consider pages outside the requested range valid.
+        if (i == block_first) {
+          block_valid |= (uint64_t(1) << (page_first & 63)) - 1;
+        }
+        if (i == block_last && (page_last & 63) != 63) {
+          block_valid |= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
+        }
+        if (block_valid != UINT64_MAX) {
+          all_valid = false;
+          break;
+        }
+      }
+      if (all_valid) {
+        rex::graphics::bo_load::reqrange_fast.fetch_add(1, std::memory_order_relaxed);  // [BO-DRAW4]
+        return true;
+      }
+    }
+  }
+  rex::graphics::bo_load::reqrange_full.fetch_add(1, std::memory_order_relaxed);  // [BO-DRAW4]
   std::pair<uint32_t, uint32_t> range(start, length);
   return RequestRanges(&range, 1);
 }
