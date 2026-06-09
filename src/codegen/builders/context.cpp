@@ -475,6 +475,12 @@ void BuilderContext::emit_load_d_form(const char* load_macro, const char* dest_t
   if (insn.operands[2] != 0)
     print("{}.u32 + ", r(insn.operands[2]));
   println("{});", static_cast<int32_t>(insn.operands[1]));
+
+  // Track guest stack-pointer switches for build_blr (longjmp/RtlRestoreContext).
+  // A load into r1 (operands[0]==1) from a base register other than r1 is a stack
+  // switch; a same-base back-chain pop (lwz r1,0(r1)) or absolute load is not.
+  if (insn.operands[0] == 1)
+    locals.r1_stack_switch = (insn.operands[2] != 0 && insn.operands[2] != 1);
 }
 
 void BuilderContext::emit_load_x_form(const char* load_macro, const char* dest_type,
@@ -495,6 +501,12 @@ void BuilderContext::emit_load_x_form(const char* load_macro, const char* dest_t
   if (insn.operands[1] != 0)
     print("{}.u32 + ", r(insn.operands[1]));
   println("{}.u32);", r(insn.operands[2]));
+
+  // Track guest stack-pointer switches for build_blr (longjmp/RtlRestoreContext).
+  // X-form base register is operands[1] (rA); a load into r1 from a non-r1 base is
+  // a stack switch.
+  if (insn.operands[0] == 1)
+    locals.r1_stack_switch = (insn.operands[1] != 0 && insn.operands[1] != 1);
 }
 
 void BuilderContext::emit_store_d_form(const char* store_macro, const char* src_type,

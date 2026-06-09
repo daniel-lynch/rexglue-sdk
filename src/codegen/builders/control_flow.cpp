@@ -92,6 +92,22 @@ bool build_bl(BuilderContext& ctx) {
 }
 
 bool build_blr(BuilderContext& ctx) {
+  // A `blr` is normally a structural return to the C++ caller. But a guest
+  // longjmp / RtlRestoreContext-style routine restores callee-saved registers,
+  // LR, *and* the stack pointer r1 from a saved context and then `blr`s to resume
+  // at the restored LR with the restored r1 (a stack switch). Modelling that as a
+  // host `return;` unwinds the host stack to whoever called the restore routine
+  // instead of transferring to the restored guest LR, leaving the host/guest
+  // stacks desynced (ctx.r1 points at a foreign frame) and crashing in the next
+  // out-of-line epilogue helper. When we have seen r1 loaded from a foreign base
+  // in this block (the stack-switch signature), lower the `blr` to a guest-LR
+  // indirect dispatch so control follows the restored LR/r1.
+  // See CoD: Black Ops sub_825FB7A0 (the engine's longjmp) and sub_8260A19C.
+  if (ctx.locals.r1_stack_switch) {
+    ctx.println("\tREX_CALL_INDIRECT_FUNC(uint32_t(ctx.lr));");
+    ctx.println("\treturn;");
+    return true;
+  }
   ctx.println("\treturn;");
   return true;
 }
