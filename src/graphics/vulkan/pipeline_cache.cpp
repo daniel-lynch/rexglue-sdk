@@ -13,6 +13,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+
+#include <rex/graphics/bo_load_probe.h>
 #include <cstring>
 #include <memory>
 #include <set>
@@ -408,6 +410,43 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     }
   }
 
+  // [PERF] Create the persistent driver pipeline cache, loading any blob from a previous run, so
+  // the pipeline precompile below AND gameplay pipeline creation reuse compiled binaries instead
+  // of recompiling from scratch (the main gameplay-stutter source). Done before the precompile so
+  // the boot precompile populates/benefits from it. Safe no-op (VK_NULL_HANDLE) if creation fails.
+  {
+    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    vk_pipeline_cache_path_ =
+        shader_storage_shareable_root / fmt::format("{:08X}.vkpipelinecache", title_id);
+    std::vector<uint8_t> initial_blob;
+    if (FILE* cache_file = rex::filesystem::OpenFile(vk_pipeline_cache_path_, "rb")) {
+      rex::filesystem::Seek(cache_file, 0, SEEK_END);
+      int64_t cache_size = rex::filesystem::Tell(cache_file);
+      if (cache_size > 0) {
+        rex::filesystem::Seek(cache_file, 0, SEEK_SET);
+        initial_blob.resize(size_t(cache_size));
+        if (fread(initial_blob.data(), 1, initial_blob.size(), cache_file) != initial_blob.size()) {
+          initial_blob.clear();
+        }
+      }
+      fclose(cache_file);
+    }
+    VkPipelineCacheCreateInfo cache_create_info = {};
+    cache_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    cache_create_info.initialDataSize = initial_blob.size();
+    cache_create_info.pInitialData = initial_blob.empty() ? nullptr : initial_blob.data();
+    if (dfn.vkCreatePipelineCache(vulkan_device->device(), &cache_create_info, nullptr,
+                                  &vk_pipeline_cache_) != VK_SUCCESS) {
+      vk_pipeline_cache_ = VK_NULL_HANDLE;
+      REXGPU_WARN("VulkanPipelineCache: failed to create VkPipelineCache; pipelines will be "
+                  "recompiled from scratch each run");
+    } else {
+      REXGPU_INFO("VulkanPipelineCache: loaded driver pipeline cache ({} bytes) from {}",
+                  initial_blob.size(), rex::path_to_utf8(vk_pipeline_cache_path_));
+    }
+  }
+
   bool edram_fragment_shader_interlock =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
 
@@ -685,6 +724,15 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       startup_loading_ = false;
     }
+    // [PERF] The boot precompile just populated the driver pipeline cache (in memory) with all
+    // stored pipelines but added no NEW storage descriptions, so the storage-write thread wouldn't
+    // otherwise persist it. Save it directly here — turning the next boot's ~24s cold compile into a
+    // fast cache load even if the user never plays further. Safe to save on this (CP) thread: the
+    // precompile creation threads have finished this batch and no gameplay submissions have started,
+    // so the storage-write thread is idle (not concurrently saving).
+    if (created_pipeline_count.load()) {
+      SaveVkPipelineCache();
+    }
   }
 
   // If any pipeline descriptions were corrupted (or the whole file has excess
@@ -726,6 +774,17 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
   }
   storage_write_shader_queue_.clear();
   storage_write_pipeline_queue_.clear();
+
+  // [PERF] Final save + destroy of the persistent driver pipeline cache (storage thread already
+  // joined above, so no concurrent SaveVkPipelineCache).
+  if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
+    SaveVkPipelineCache();
+    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+    vulkan_device->functions().vkDestroyPipelineCache(vulkan_device->device(), vk_pipeline_cache_,
+                                                      nullptr);
+    vk_pipeline_cache_ = VK_NULL_HANDLE;
+  }
+  vk_pipeline_cache_path_.clear();
 
   if (pipeline_storage_file_) {
     fclose(pipeline_storage_file_);
@@ -1235,6 +1294,10 @@ void VulkanPipelineCache::GetPipelineAndLayoutByHandle(
 bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                                   VulkanShader::VulkanTranslation& translation) {
   VulkanShader& shader = static_cast<VulkanShader&>(translation.shader());
+
+  // [BO-LOAD] time guest-ucode -> SPIR-V translation (the shader half of a cache miss).
+  rex::graphics::bo_load::ScopedTally _bo_tally(&rex::graphics::bo_load::shaders_translated,
+                                                &rex::graphics::bo_load::shader_translate_ns);
 
   // Perform translation.
   // If this fails the shader will be marked as invalid and ignored later.
@@ -3480,8 +3543,16 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   VkPipeline pipeline;
-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
-                                                         &pipeline_create_info, nullptr, &pipeline);
+  VkResult create_result;
+  {  // [BO-LOAD] time the actual GPU pipeline compile (cache-miss cost).
+    rex::graphics::bo_load::ScopedTally _bo_tally(&rex::graphics::bo_load::pipelines_created,
+                                                  &rex::graphics::bo_load::pipeline_compile_ns);
+    // [PERF] use the persistent driver pipeline cache (vk_pipeline_cache_) so the driver reuses
+    // previously-compiled binaries instead of recompiling from scratch. VK_NULL_HANDLE if the
+    // cache is unavailable (behaves exactly as before).
+    create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
+                                                  &pipeline_create_info, nullptr, &pipeline);
+  }
   if (create_result != VK_SUCCESS) {
     uint64_t ps_hash = creation_arguments.pixel_shader
                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
@@ -3622,6 +3693,43 @@ void VulkanPipelineCache::ProcessDeferredPipelineDestructions(bool force_all) {
   }
 }
 
+void VulkanPipelineCache::SaveVkPipelineCache() {
+  // [PERF] Persist the driver pipeline cache blob so subsequent runs skip recompilation. Written
+  // atomically (temp + rename) so the game's SIGKILL exit can't leave a torn file. Called from the
+  // storage-write thread on each pipeline flush (incremental, survives SIGKILL) and on shutdown.
+  if (vk_pipeline_cache_ == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty()) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  VkDevice device = vulkan_device->device();
+  size_t data_size = 0;
+  if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &data_size, nullptr) != VK_SUCCESS ||
+      data_size == 0) {
+    return;
+  }
+  std::vector<uint8_t> data(data_size);
+  if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &data_size, data.data()) !=
+      VK_SUCCESS) {
+    return;
+  }
+  std::filesystem::path tmp_path = vk_pipeline_cache_path_;
+  tmp_path += ".tmp";
+  FILE* f = rex::filesystem::OpenFile(tmp_path, "wb");
+  if (!f) {
+    return;
+  }
+  bool ok = fwrite(data.data(), 1, data_size, f) == data_size;
+  fclose(f);
+  std::error_code ec;
+  if (ok) {
+    std::filesystem::rename(tmp_path, vk_pipeline_cache_path_, ec);
+  }
+  if (!ok || ec) {
+    std::filesystem::remove(tmp_path, ec);
+  }
+}
+
 void VulkanPipelineCache::StorageWriteThread() {
   ShaderStoredHeader shader_header;
   // Don't leak anything in unused bits.
@@ -3643,6 +3751,9 @@ void VulkanPipelineCache::StorageWriteThread() {
       flush_pipelines = false;
       assert_not_null(pipeline_storage_file_);
       fflush(pipeline_storage_file_);
+      // [PERF] persist the driver pipeline cache alongside the description flush — incremental and
+      // off the render thread, so newly-compiled gameplay pipelines survive the game's SIGKILL exit.
+      SaveVkPipelineCache();
     }
 
     const Shader* shader = nullptr;

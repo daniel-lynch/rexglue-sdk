@@ -444,6 +444,16 @@ class VulkanPipelineCache {
   FILE* pipeline_storage_file_ = nullptr;
   bool pipeline_storage_file_flush_needed_ = false;
 
+  // [PERF] Persistent DRIVER pipeline cache (VkPipelineCache). Without it,
+  // vkCreateGraphicsPipelines recompiles every pipeline from scratch every run (gameplay
+  // compiles measured at 100-540ms each under load -> dropped frames / stutter). Loaded from
+  // disk in InitializeShaderStorage, passed to every vkCreateGraphicsPipelines, and saved
+  // incrementally by the storage-write thread (the game exits via SIGKILL, so we cannot rely on
+  // a clean Shutdown to persist it). The blob is driver/GPU-specific (not portable).
+  VkPipelineCache vk_pipeline_cache_ = VK_NULL_HANDLE;
+  std::filesystem::path vk_pipeline_cache_path_;
+  void SaveVkPipelineCache();
+
   // Thread for asynchronous writing to the storage streams.
   void StorageWriteThread();
   std::mutex storage_write_request_lock_;

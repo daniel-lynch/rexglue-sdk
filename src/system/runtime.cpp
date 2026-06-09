@@ -316,6 +316,20 @@ system::object_ref<system::XThread> Runtime::PrepareModuleLaunch() {
     return nullptr;
   }
 
+  // Initialize the persistent shader/pipeline storage for this title. Without this,
+  // the pipeline cache is never wired up, so every run recompiles all guest shaders
+  // from scratch -> mid-gameplay compile stalls. Persisting to disk means the first
+  // run populates the cache and subsequent runs load precompiled pipelines (smooth).
+  // Non-blocking: the stored pipelines (re)compile on background threads at startup.
+  if (graphics_system_) {
+    std::error_code shader_cache_ec;
+    std::filesystem::path shader_cache_root = std::filesystem::current_path() / "cache";
+    std::filesystem::create_directories(shader_cache_root, shader_cache_ec);
+    REXSYS_INFO("Initializing shader storage at '{}' for title {:08X}",
+                rex::path_to_utf8(shader_cache_root), executable->title_id());
+    graphics_system_->InitializeShaderStorage(shader_cache_root, executable->title_id(), false);
+  }
+
   auto thread = kernel_state_->PrepareModuleLaunch(executable);
   if (!thread) {
     REXSYS_ERROR("Runtime::PrepareModuleLaunch: Failed to prepare module");
