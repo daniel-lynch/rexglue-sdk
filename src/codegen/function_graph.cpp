@@ -509,11 +509,18 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
       continue;
     }
 
+    // r1 stack-switch tracking (for build_blr) is block-scoped: a foreign-base
+    // load into r1 and its terminal blr always live in the same straight-line run.
+    localVariables.r1_stack_switch = false;
+
     while (blockBase < blockEnd) {
       // Only emit each label once
       if (labels.find(blockBase) != labels.end() && emittedLabels.insert(blockBase).second) {
         emit_println(body, "loc_{:X}:", blockBase);
         csrState = CSRState::Unknown;
+        // A new label starts a fresh control-flow path; clear stack-switch state so
+        // a foreign r1-load before the label does not leak into this path's blr.
+        localVariables.r1_stack_switch = false;
       }
 
       // Look up switch table for this address

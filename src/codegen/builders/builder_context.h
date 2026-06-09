@@ -43,6 +43,17 @@ struct RecompilerLocalVariables {
   /// or when oris sets upper bits >= 0xC800 (address >= 0xC8000000)
   uint32_t mmio_base_regs{0};
 
+  /// True when r1 (the guest stack pointer) was most recently loaded from a
+  /// *foreign* base register (a load `r1 = MEM[rX + off]`, rX != r1). This is the
+  /// signature of a guest longjmp / RtlRestoreContext-style routine performing a
+  /// stack switch (e.g. CoD: Black Ops `sub_825FB7A0`: `ld r1,144(r7)` ... `blr`).
+  /// Normal epilogues restore r1 via `addi r1,r1,N` or the back-chain load
+  /// `lwz r1,0(r1)` (base == r1), which never sets this. build_blr uses it to lower
+  /// the terminal `blr` to a guest-LR indirect dispatch instead of a host `return`,
+  /// so control transfers to the restored guest LR with the restored r1.
+  /// Reset at every basic-block / label boundary (see function_graph.cpp).
+  bool r1_stack_switch{false};
+
   void set_mmio_base(size_t reg) {
     if (reg < 32)
       mmio_base_regs |= (1u << reg);
