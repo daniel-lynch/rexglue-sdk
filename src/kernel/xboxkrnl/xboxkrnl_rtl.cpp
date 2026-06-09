@@ -21,6 +21,7 @@
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
+#include <rex/ppc/function.h>
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
@@ -554,15 +555,9 @@ u32 RtlComputeCrc32_entry(u32 seed, mapped_void buffer, u32 length) {
   return ~hash;
 }
 
-void RtlCaptureContext_entry() {
-  // TODO(tomc): do we even need this?
-  REXKRNL_WARN("[STUB] RtlCaptureContext called - not implemented");
-}
-
-void RtlUnwind_entry() {
-  // TODO(tomc): do we even need this?
-  REXKRNL_WARN("[STUB] RtlUnwind called - not implemented");
-}
+// RtlCaptureContext / RtlUnwind have faithful raw-register-file implementations as
+// REX_FUNCs at the bottom of this file (setjmp/longjmp CONTEXT primitives), so the
+// stub _entry shims and their REX_EXPORTs are intentionally omitted here.
 
 void __C_specific_handler_entry() {
   // TODO(tomc): do we even need this?
@@ -625,6 +620,159 @@ REX_EXPORT(__imp__RtlLeaveCriticalSection, rex::kernel::xboxkrnl::RtlLeaveCritic
 REX_EXPORT(__imp__RtlTimeToTimeFields, rex::kernel::xboxkrnl::RtlTimeToTimeFields_entry)
 REX_EXPORT(__imp__RtlTimeFieldsToTime, rex::kernel::xboxkrnl::RtlTimeFieldsToTime_entry)
 REX_EXPORT(__imp__RtlComputeCrc32, rex::kernel::xboxkrnl::RtlComputeCrc32_entry)
-REX_EXPORT(__imp__RtlCaptureContext, rex::kernel::xboxkrnl::RtlCaptureContext_entry)
-REX_EXPORT(__imp__RtlUnwind, rex::kernel::xboxkrnl::RtlUnwind_entry)
 REX_EXPORT(__imp____C_specific_handler, rex::kernel::xboxkrnl::__C_specific_handler_entry)
+
+//=============================================================================
+// Structured-exception / setjmp-longjmp CONTEXT primitives
+//=============================================================================
+// Guest big-endian memory helpers. The recompiler's REX_LOAD/STORE/RAW_ADDR macros are
+// only emitted into generated code (they depend on per-image REX_*_BASE constants), so
+// these SDK-side REX_FUNCs replicate the same membase + physical-offset addressing and
+// byte-swap directly against `base`.
+namespace {
+inline uint8_t* rtl_raw(uint8_t* base, uint32_t a) {
+  return base + a + ((a >= 0xE0000000u) ? 0x1000u : 0u);
+}
+inline uint32_t rtl_load_u32(uint8_t* base, uint32_t a) {
+  return __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(rtl_raw(base, a)));
+}
+inline uint64_t rtl_load_u64(uint8_t* base, uint32_t a) {
+  return __builtin_bswap64(*reinterpret_cast<volatile uint64_t*>(rtl_raw(base, a)));
+}
+inline void rtl_store_u32(uint8_t* base, uint32_t a, uint32_t v) {
+  *reinterpret_cast<volatile uint32_t*>(rtl_raw(base, a)) = __builtin_bswap32(v);
+}
+inline void rtl_store_u64(uint8_t* base, uint32_t a, uint64_t v) {
+  *reinterpret_cast<volatile uint64_t*>(rtl_raw(base, a)) = __builtin_bswap64(v);
+}
+}  // namespace
+
+// These need raw access to the whole guest register file, so they are written as
+// REX_FUNCs (not typed _entry shims) and registered by name.
+//
+// The guest CONTEXT buffer layout used here is the compact, callee-saved snapshot
+// that the engine's own restore routine consumes (CoD: Black Ops sub_825FB7A0, an
+// RtlRestoreContext-style longjmp that ends in `blr`):
+//
+//   +0x000  f14..f31   18 doubles (nonvolatile FPRs)
+//   +0x090  r1         saved stack pointer
+//   +0x098  r13..r31   19 GPRs    (nonvolatile)
+//   +0x130  CR         packed, mfcr order (cr0 in bits 31..28)
+//   +0x134  LR         return address -> the resume / setjmp site
+//   +0x138  mode flag  0 = plain context restore (no RtlUnwind dispatch)
+//   +0x140  v64..v127  64 VMX regs, stored byte-reversed (lvx128/stvx128 order)
+//
+// RtlCaptureContext is the "capture" (setjmp) half; the guest restore routine is
+// the "longjmp" half, whose terminal `blr` codegen now lowers to a guest-LR
+// indirect dispatch so the stack switch (restored r1 + LR) actually takes effect.
+
+// RtlCaptureContext(PCONTEXT ContextRecord): snapshot the caller's nonvolatile
+// register file, stack pointer, return address and CR into the buffer in r3.
+extern "C" REX_FUNC(__imp__RtlCaptureContext) {
+  const uint32_t buf = ctx.r3.u32;
+  if (!buf) {
+    REXKRNL_WARN("RtlCaptureContext: null CONTEXT pointer");
+    return;
+  }
+
+  // f14..f31 -> +0x000 (contiguous in PPCContext)
+  const auto* fpr = &ctx.f14;
+  for (uint32_t i = 0; i < 18; ++i)
+    rtl_store_u64(base, buf + i * 8, fpr[i].u64);
+
+  // r1 (saved stack pointer) -> +0x090
+  rtl_store_u64(base, buf + 144, ctx.r1.u64);
+
+  // r13..r31 -> +0x098 (contiguous in PPCContext)
+  const auto* gpr = &ctx.r13;
+  for (uint32_t i = 0; i < 19; ++i)
+    rtl_store_u64(base, buf + 152 + i * 8, gpr[i].u64);
+
+  // CR (packed, mfcr order) -> +0x130
+  const uint32_t cr = (ctx.cr0.raw() << 28) | (ctx.cr1.raw() << 24) | (ctx.cr2.raw() << 20) |
+                      (ctx.cr3.raw() << 16) | (ctx.cr4.raw() << 12) | (ctx.cr5.raw() << 8) |
+                      (ctx.cr6.raw() << 4) | ctx.cr7.raw();
+  rtl_store_u32(base, buf + 304, cr);
+
+  // LR (resume address) -> +0x134
+  rtl_store_u32(base, buf + 308, static_cast<uint32_t>(ctx.lr));
+
+  // mode flag -> +0x138: 0 selects the plain restore path in the guest routine
+  rtl_store_u32(base, buf + 312, 0);
+
+  // v64..v127 -> +0x140, byte-reversed to match lvx128/stvx128 ordering
+  const auto* vr = &ctx.v64;
+  for (uint32_t i = 0; i < 64; ++i) {
+    uint8_t* dst = rtl_raw(base, buf + 320 + i * 16);
+    for (uint32_t b = 0; b < 16; ++b)
+      dst[b] = vr[i].u8[15 - b];
+  }
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlCaptureContext(
+    "__imp__RtlCaptureContext", &__imp__RtlCaptureContext);
+
+// RtlRestoreContext(PCONTEXT ContextRecord, PEXCEPTION_RECORD): restore the
+// captured register file and transfer control to the saved LR (longjmp). BO does
+// not import this (it ships its own restore, sub_825FB7A0), but provide a faithful
+// implementation for titles that do.
+extern "C" REX_FUNC(__imp__RtlRestoreContext) {
+  const uint32_t buf = ctx.r3.u32;
+  if (!buf) {
+    REXKRNL_WARN("RtlRestoreContext: null CONTEXT pointer");
+    return;
+  }
+
+  auto* fpr = &ctx.f14;
+  for (uint32_t i = 0; i < 18; ++i)
+    fpr[i].u64 = rtl_load_u64(base, buf + i * 8);
+
+  ctx.r1.u64 = rtl_load_u64(base, buf + 144);
+
+  auto* gpr = &ctx.r13;
+  for (uint32_t i = 0; i < 19; ++i)
+    gpr[i].u64 = rtl_load_u64(base, buf + 152 + i * 8);
+
+  const uint32_t cr = rtl_load_u32(base, buf + 304);
+  ctx.cr0.set_raw((cr >> 28) & 0xF);
+  ctx.cr1.set_raw((cr >> 24) & 0xF);
+  ctx.cr2.set_raw((cr >> 20) & 0xF);
+  ctx.cr3.set_raw((cr >> 16) & 0xF);
+  ctx.cr4.set_raw((cr >> 12) & 0xF);
+  ctx.cr5.set_raw((cr >> 8) & 0xF);
+  ctx.cr6.set_raw((cr >> 4) & 0xF);
+  ctx.cr7.set_raw(cr & 0xF);
+
+  ctx.lr = rtl_load_u32(base, buf + 308);
+
+  auto* vr = &ctx.v64;
+  for (uint32_t i = 0; i < 64; ++i) {
+    const uint8_t* src = rtl_raw(base, buf + 320 + i * 16);
+    for (uint32_t b = 0; b < 16; ++b)
+      vr[i].u8[b] = src[15 - b];
+  }
+
+  // Transfer control to the restored LR with the restored r1.
+  auto* ks = rex::system::kernel_state();
+  if (ks && ks->function_dispatcher()) {
+    ::PPCFunc* fn = ks->function_dispatcher()->GetFunction(static_cast<uint32_t>(ctx.lr));
+    if (fn) {
+      fn(ctx, base);
+      return;
+    }
+  }
+  REXKRNL_WARN("RtlRestoreContext: no guest function at LR {:08X}", static_cast<uint32_t>(ctx.lr));
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlRestoreContext(
+    "__imp__RtlRestoreContext", &__imp__RtlRestoreContext);
+
+// RtlUnwind(TargetFrame, TargetIp, ExceptionRecord, ReturnValue): run frame-based
+// unwinding. Full termination-handler unwinding is not modeled; the engine's guest
+// unwind wrapper (sub_825FB7A0's RtlUnwind branch) performs the actual control
+// transfer via its own epilogue, and expects this call to return. Propagate the
+// unwind return value (r6) into r3 and return.
+extern "C" REX_FUNC(__imp__RtlUnwind) {
+  (void)base;
+  ctx.r3.u64 = ctx.r6.u64;
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlUnwind("__imp__RtlUnwind",
+                                                               &__imp__RtlUnwind);

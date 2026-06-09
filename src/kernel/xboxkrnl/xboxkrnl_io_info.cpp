@@ -431,9 +431,15 @@ u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
     }
     case XFileFsDeviceInformation: {
       auto info = info_ptr.as<X_FILE_FS_DEVICE_INFORMATION*>();
-      REXKRNL_WARN("Stub XFileFsDeviceInformation!");
-      info->device_type = FILE_DEVICE_UNKNOWN;
-      info->characteristics = 0;
+      auto device = file->device();
+      const auto& dev_name = device->name();
+      // Report a mounted fixed disk. Games (e.g. the cache/HDD mount path) check
+      // the device type/characteristics to decide whether storage is ready;
+      // FILE_DEVICE_UNKNOWN with no characteristics makes them retry forever.
+      info->device_type = FILE_DEVICE_DISK;
+      info->characteristics = FILE_DEVICE_IS_MOUNTED;
+      REXKRNL_DEBUG("XFileFsDeviceInformation: device='{}' -> type=DISK, mounted",
+                    dev_name);
       out_length = sizeof(X_FILE_FS_DEVICE_INFORMATION);
       break;
     }

@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cerrno>
 #include <cstring>
 
 #include <rex/chrono/clock.h>
@@ -45,6 +46,27 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+#if !REX_PLATFORM_WIN32
+// Map a POSIX errno to the Winsock error code the guest expects. Critically,
+// EAGAIN/EWOULDBLOCK must become WSAEWOULDBLOCK (10035) so non-blocking recv
+// callers treat "no data yet" as benign instead of a fatal socket error.
+static uint32_t PosixErrnoToWsa(int e) {
+  switch (e) {
+    case EWOULDBLOCK:   return 10035;  // WSAEWOULDBLOCK (== EAGAIN on Linux)
+    case EINPROGRESS:   return 10036;  // WSAEINPROGRESS
+    case EALREADY:      return 10037;  // WSAEALREADY
+    case ENOTSOCK:      return 10038;  // WSAENOTSOCK
+    case EMSGSIZE:      return 10040;  // WSAEMSGSIZE
+    case EADDRINUSE:    return 10048;  // WSAEADDRINUSE
+    case EADDRNOTAVAIL: return 10049;  // WSAEADDRNOTAVAIL
+    case ECONNRESET:    return 10054;  // WSAECONNRESET
+    case ETIMEDOUT:     return 10060;  // WSAETIMEDOUT
+    case ECONNREFUSED:  return 10061;  // WSAECONNREFUSED
+    default:            return 10035;  // default to WOULDBLOCK so callers retry
+  }
+}
+#endif
 
 // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
 enum {
@@ -620,7 +642,7 @@ i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
     uint32_t error_code = WSAGetLastError();
     XThread::SetLastError(error_code);
 #else
-    XThread::SetLastError(0x0);
+    XThread::SetLastError(PosixErrnoToWsa(errno));
 #endif
   }
   return ret;
@@ -884,7 +906,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
     uint32_t error_code = WSAGetLastError();
     XThread::SetLastError(error_code);
 #else
-    XThread::SetLastError(0x0);
+    XThread::SetLastError(PosixErrnoToWsa(errno));
 #endif
   }
 

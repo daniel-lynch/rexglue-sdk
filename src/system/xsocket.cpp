@@ -76,15 +76,34 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, 
     return X_STATUS_SUCCESS;
   }
 
-  int ret = setsockopt(native_handle_, level, optname, (char*)optval_ptr, optlen);
+  // Guest titles use the Winsock socket-option ABI (SOL_SOCKET == 0xFFFF, and
+  // SO_* codes that differ from POSIX). Translate the common SOL_SOCKET options
+  // to their host equivalents; passing the Winsock codes straight to the host
+  // setsockopt() fails. Unrecognized SOL_SOCKET options are accepted as no-ops
+  // (benign for single-player) so net setup doesn't fail on them.
+  int host_level = static_cast<int>(level);
+  int host_opt = static_cast<int>(optname);
+  if (level == 0xFFFF) {
+    host_level = SOL_SOCKET;
+    switch (optname) {
+      case 0x0004: host_opt = SO_REUSEADDR; break;
+      case 0x0008: host_opt = SO_KEEPALIVE; break;
+      case 0x0010: host_opt = SO_DONTROUTE; break;
+      case 0x0020: host_opt = SO_BROADCAST; broadcast_socket_ = true; break;
+      case 0x0100: host_opt = SO_OOBINLINE; break;
+      case 0x1001: host_opt = SO_SNDBUF; break;
+      case 0x1002: host_opt = SO_RCVBUF; break;
+      default:
+        // Unsupported/struct-shaped (e.g. SO_LINGER) or title-specific option;
+        // accept silently rather than failing the net subsystem.
+        return X_STATUS_SUCCESS;
+    }
+  }
+
+  int ret = setsockopt(native_handle_, host_level, host_opt, (char*)optval_ptr, optlen);
   if (ret < 0) {
     // TODO: WSAGetLastError()
     return X_STATUS_UNSUCCESSFUL;
-  }
-
-  // SO_BROADCAST
-  if (level == 0xFFFF && optname == 0x0020) {
-    broadcast_socket_ = true;
   }
 
   return X_STATUS_SUCCESS;
@@ -112,7 +131,18 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
   int ret = bind(native_handle_, (sockaddr*)name, name_len);
   if (ret < 0) {
-    return X_STATUS_UNSUCCESSFUL;
+    // Guest titles bind to fixed Xbox ports/addresses the host often can't grab
+    // (privileged, already in use, or a non-local guest address). For single-
+    // player the title only needs a usable bound socket, so fall back to an
+    // ephemeral wildcard bind rather than failing the whole net subsystem.
+    sockaddr_in fallback{};
+    fallback.sin_family = AF_INET;
+    fallback.sin_addr.s_addr = htonl(INADDR_ANY);
+    fallback.sin_port = 0;  // let the OS pick a free port
+    ret = bind(native_handle_, (sockaddr*)&fallback, sizeof(fallback));
+    if (ret < 0) {
+      return X_STATUS_UNSUCCESSFUL;
+    }
   }
 
   bound_ = true;

@@ -1,3 +1,4 @@
+#include <atomic>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -112,7 +113,21 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   }
 
   auto* is = input_system();
-  return is->GetState(actual_user_index, input_state);
+  auto result = is->GetState(actual_user_index, input_state);
+  // [INPUTDBG] prove injected input reaches the guest: log when any control is active.
+  if (input_state) {
+    uint16_t b = input_state->gamepad.buttons;
+    int16_t lx = input_state->gamepad.thumb_lx, ly = input_state->gamepad.thumb_ly;
+    if (b || input_state->gamepad.left_trigger || input_state->gamepad.right_trigger ||
+        lx > 8000 || lx < -8000 || ly > 8000 || ly < -8000) {
+      static std::atomic<int> n{0};
+      if (n.fetch_add(1) < 120)
+        REXKRNL_WARN("[INPUTDBG] user={} buttons=0x{:04X} lt={} rt={} lx={} ly={}",
+                     (uint32_t)actual_user_index, b, input_state->gamepad.left_trigger,
+                     input_state->gamepad.right_trigger, lx, ly);
+    }
+  }
+  return result;
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx
