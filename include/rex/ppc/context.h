@@ -14,6 +14,7 @@
 #pragma once
 
 #include <atomic>
+#include <shared_mutex>
 #include <bit>
 #include <cassert>
 #include <csetjmp>
@@ -144,9 +145,28 @@ using PPCFunc = void(PPCContext& ctx, uint8_t* base);
 
 #undef PPC_CALL_INDIRECT_FUNC
 #include <rex/perf/counter.h>
-#define PPC_CALL_INDIRECT_FUNC(x) \
-  PROFILE_FUNCTION_DISPATCHED();  \
-  PPC_LOOKUP_FUNC(base, x)(ctx, base);
+// [NULLCALL DEBUG] log + skip indirect calls whose resolved host fn is null (guest
+// target unmapped / not recompiled, e.g. a missed vtable thunk). ctx.lr = guest
+// callsite; x = guest target. Add such targets to config/functions.toml. Revert after.
+#include <cstdio>
+inline void rex_dbg_on_null_indirect(uint32_t guest_lr, uint32_t target) {
+  static std::atomic<int> count{0};
+  int c = count.fetch_add(1, std::memory_order_relaxed);
+  if (c < 200)
+    std::fprintf(stderr, "[NULLCALL] target=0x%08X resolved NULL, from lr=0x%08X (#%d)\n",
+                 target, guest_lr, c);
+  if (c == 199) std::fprintf(stderr, "[NULLCALL] (suppressing further)\n");
+  std::fflush(stderr);
+}
+#define PPC_CALL_INDIRECT_FUNC(x)                                                   \
+  PROFILE_FUNCTION_DISPATCHED();                                                    \
+  {                                                                                 \
+    PPCFunc* _rex_f = PPC_LOOKUP_FUNC(base, x);                                     \
+    if (__builtin_expect(_rex_f == nullptr, 0))                                     \
+      rex_dbg_on_null_indirect((uint32_t)ctx.lr, (uint32_t)(x));                    \
+    else                                                                            \
+      _rex_f(ctx, base);                                                            \
+  }
 
 #endif  // PPC_CONFIG_H_INCLUDED
 
@@ -515,33 +535,65 @@ inline std::unordered_map<uint32_t, jmp_buf>& get_jmp_buf_map() {
 // PPC Interrupt and Exception Handling
 //=============================================================================
 
-// Global lock count storage - tracks nesting depth
-inline std::atomic<int32_t>& ppc_global_lock_count_() {
-  static std::atomic<int32_t> count{0};
-  return count;
+// [PERF] EE-disable model — replaces the old process-wide recursive_mutex.
+//
+// The guest mtmsrd instruction toggles the MSR external-interrupt-enable (EE) bit to create
+// "interrupts disabled" critical regions. The recompiler maps `mtmsrd r13` -> ENTER (disable)
+// and `mtmsrd <other>` -> LEAVE (restore). Xenia historically emulated this with ONE process-wide
+// recursive_mutex, which serialized EVERY guest thread whenever any one disabled interrupts — and
+// the job system does that ~tens of thousands of times per frame around tiny lwarx/stwcx
+// interlocked ops. That was the dominant cross-thread contention.
+//
+// Key insight: on real hardware, disabling EE is a PER-CORE operation — it defers interrupt
+// delivery to that core but does NOT provide cross-core mutual exclusion (that comes from
+// lwarx/stwcx reservations, which the recompiler maps to host atomics). So EE-disabled regions on
+// different threads need not exclude each other; they only need to exclude interrupt DELIVERY.
+// We model exactly that with a reader/writer lock:
+//   * guest EE-disable (mtmsrd r13)            -> SHARED   (run concurrently across guest threads)
+//   * interrupt dispatch (ExecuteInterrupt)    -> EXCLUSIVE (waits for all EE regions; blocks new)
+// Cross-thread safety of the protected interlocked ops is unchanged (host-atomic lwarx/stwcx),
+// and "interrupts disabled blocks interrupt delivery" is preserved by the shared/exclusive pairing.
+inline std::shared_mutex& ppc_ee_mutex() {
+  static std::shared_mutex m;
+  return m;
+}
+// Per-thread EE-disable nesting depth. Only the OUTERMOST mtmsrd takes the shared lock — a thread
+// must hold at most one shared lock at a time (recursive shared locking can deadlock behind a
+// pending exclusive waiter).
+inline int32_t& ppc_ee_depth() {
+  static thread_local int32_t depth = 0;
+  return depth;
+}
+// True on the thread currently servicing an interrupt (it holds ppc_ee_mutex EXCLUSIVELY). While
+// set, nested guest mtmsrd on that thread only adjusts the depth and does NOT take the shared lock,
+// which would self-deadlock against the thread's own exclusive hold.
+inline bool& ppc_ee_in_interrupt() {
+  static thread_local bool in_interrupt = false;
+  return in_interrupt;
 }
 
-// Check global lock state (for mfmsr)
-// Returns 0x8000 if unlocked (interrupts enabled), 0 if locked
-#define PPC_CHECK_GLOBAL_LOCK()                                        \
-  ([&]() -> uint64_t {                                                 \
-    auto lock_ = rex::thread::global_critical_region::AcquireDirect(); \
-    return ppc_global_lock_count_().load() ? 0 : 0x8000;               \
-  }())
+// Check EE state (for mfmsr): 0x8000 if interrupts ENABLED, 0 if disabled. Per-thread, lock-free
+// (and more correct than the old global count — mfmsr reports the CURRENT thread's MSR).
+#define PPC_CHECK_GLOBAL_LOCK() (ppc_ee_depth() ? uint64_t(0) : uint64_t(0x8000))
 
-// Enter global lock (for mtmsrd from r13)
-#define PPC_ENTER_GLOBAL_LOCK()                          \
-  do {                                                   \
-    rex::thread::global_critical_region::mutex().lock(); \
-    ppc_global_lock_count_().fetch_add(1);               \
+// Enter EE-disabled region (mtmsrd from r13).
+#define PPC_ENTER_GLOBAL_LOCK()         \
+  do {                                  \
+    if (ppc_ee_in_interrupt()) {        \
+      ++ppc_ee_depth();                 \
+    } else if (ppc_ee_depth()++ == 0) { \
+      ppc_ee_mutex().lock_shared();     \
+    }                                   \
   } while (0)
 
-// Leave global lock (for mtmsrd from non-r13)
-#define PPC_LEAVE_GLOBAL_LOCK()                                                           \
-  do {                                                                                    \
-    auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
-    assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
-    rex::thread::global_critical_region::mutex().unlock();                                \
+// Leave EE-disabled region (mtmsrd from non-r13).
+#define PPC_LEAVE_GLOBAL_LOCK()           \
+  do {                                    \
+    if (ppc_ee_in_interrupt()) {          \
+      --ppc_ee_depth();                   \
+    } else if (--ppc_ee_depth() == 0) {   \
+      ppc_ee_mutex().unlock_shared();     \
+    }                                     \
   } while (0)
 
 //=============================================================================

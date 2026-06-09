@@ -220,10 +220,17 @@ class XObject {
     return reinterpret_cast<T*>(CreateNative(sizeof(T)));
   }
 
-  // Stash native pointer into X_DISPATCH_HEADER
+  // Stash native pointer into X_DISPATCH_HEADER.
+  // Write the handle FIRST, then publish the signature with a release store. This pairs with
+  // the LOCK-FREE acquire-load fast path in XObject::GetNativeObject: a reader that observes the
+  // signature is guaranteed to also see the handle written here (and, transitively, the object's
+  // table registration done in the XObject ctor before this is reached). Order matters — do not
+  // reorder these stores. .value is the raw big-endian storage of the be<uint32_t>; we store the
+  // byte-swapped signature directly so the atomic store covers exactly that 4-byte field.
   static void StashHandle(X_DISPATCH_HEADER* header, uint32_t handle) {
-    header->wait_list_flink = kXObjSignature;
     header->wait_list_blink = handle;
+    std::atomic_ref<uint32_t> flink_ref(header->wait_list_flink.value);
+    flink_ref.store(rex::byte_swap<uint32_t>(uint32_t(kXObjSignature)), std::memory_order_release);
   }
 
   static uint32_t TimeoutTicksToMs(int64_t timeout_ticks);

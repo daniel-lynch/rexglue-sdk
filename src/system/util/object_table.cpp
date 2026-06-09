@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
+#include <shared_mutex>
 
 #include <rex/logging.h>
 #include <rex/stream.h>
@@ -27,23 +29,30 @@ ObjectTable::~ObjectTable() {
 }
 
 void ObjectTable::Reset() {
-  auto global_lock = global_critical_region_.Acquire();
-
-  // Release all objects.
-  for (uint32_t n = 0; n < table_capacity_; n++) {
-    ObjectTableEntry& entry = table_[n];
-    if (entry.object) {
-      entry.object->Release();
+  // Collect victims under the lock, Release them after unlocking: object destruction
+  // (~XThread -> UnregisterThread) re-enters the global lock, which must never be taken
+  // while holding table_mutex_.
+  std::vector<XObject*> to_release;
+  {
+    std::unique_lock<std::shared_mutex> lock(table_mutex_);
+    for (uint32_t n = 0; n < table_capacity_; n++) {
+      ObjectTableEntry& entry = table_[n];
+      if (entry.object) {
+        to_release.push_back(entry.object);
+        entry.object = nullptr;
+      }
     }
+    table_capacity_ = 0;
+    last_free_entry_ = 0;
+    free(table_);
+    table_ = nullptr;
   }
-
-  table_capacity_ = 0;
-  last_free_entry_ = 0;
-  free(table_);
-  table_ = nullptr;
+  for (XObject* object : to_release) {
+    object->Release();
+  }
 }
 
-X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
+X_STATUS ObjectTable::FindFreeSlotLocked(uint32_t* out_slot) {
   // Find a free slot.
   uint32_t slot = last_free_entry_;
   uint32_t scan_count = 0;
@@ -64,7 +73,7 @@ X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
 
   // Table out of slots, expand.
   uint32_t new_table_capacity = std::max(16 * 1024u, table_capacity_ * 2);
-  if (!Resize(new_table_capacity)) {
+  if (!ResizeLocked(new_table_capacity)) {
     return X_STATUS_NO_MEMORY;
   }
 
@@ -75,7 +84,7 @@ X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
   return X_STATUS_SUCCESS;
 }
 
-bool ObjectTable::Resize(uint32_t new_capacity) {
+bool ObjectTable::ResizeLocked(uint32_t new_capacity) {
   uint32_t new_size = new_capacity * sizeof(ObjectTableEntry);
   uint32_t old_size = table_capacity_ * sizeof(ObjectTableEntry);
   auto new_table = reinterpret_cast<ObjectTableEntry*>(realloc(table_, new_size));
@@ -100,11 +109,11 @@ X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
 
   uint32_t handle = 0;
   {
-    auto global_lock = global_critical_region_.Acquire();
+    std::unique_lock<std::shared_mutex> lock(table_mutex_);
 
     // Find a free slot.
     uint32_t slot = 0;
-    result = FindFreeSlot(&slot);
+    result = FindFreeSlotLocked(&slot);
 
     // Stash.
     if (XSUCCEEDED(result)) {
@@ -134,7 +143,9 @@ X_STATUS ObjectTable::DuplicateHandle(X_HANDLE handle, X_HANDLE* out_handle) {
   X_STATUS result = X_STATUS_SUCCESS;
   handle = TranslateHandle(handle);
 
-  XObject* object = LookupObject(handle, false);
+  // LookupObject (shared lock) releases its lock before AddHandle (exclusive lock) — no
+  // nesting, no lock-ordering issue.
+  XObject* object = LookupObject(handle);
   if (object) {
     result = AddHandle(object, out_handle);
     object->Release();  // Release the ref that LookupObject took
@@ -146,7 +157,7 @@ X_STATUS ObjectTable::DuplicateHandle(X_HANDLE handle, X_HANDLE* out_handle) {
 }
 
 X_STATUS ObjectTable::RetainHandle(X_HANDLE handle) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::unique_lock<std::shared_mutex> lock(table_mutex_);
 
   ObjectTableEntry* entry = LookupTable(handle);
   if (!entry) {
@@ -158,25 +169,57 @@ X_STATUS ObjectTable::RetainHandle(X_HANDLE handle) {
 }
 
 X_STATUS ObjectTable::ReleaseHandle(X_HANDLE handle) {
-  auto global_lock = global_critical_region_.Acquire();
+  XObject* to_release = nullptr;
+  std::string name_to_remove;
+  X_STATUS result = X_STATUS_SUCCESS;
+  {
+    std::unique_lock<std::shared_mutex> lock(table_mutex_);
 
-  ObjectTableEntry* entry = LookupTable(handle);
-  if (!entry) {
-    return X_STATUS_INVALID_HANDLE;
+    ObjectTableEntry* entry = LookupTable(handle);
+    if (!entry) {
+      return X_STATUS_INVALID_HANDLE;
+    }
+
+    if (--entry->handle_ref_count == 0) {
+      // No more references. Remove it from the table (under the same lock).
+      result = RemoveHandleLocked(handle, &to_release, &name_to_remove);
+    }
+    // else: FIXME: a status code telling the caller it wasn't released (not a failure).
   }
-
-  if (--entry->handle_ref_count == 0) {
-    // No more references. Remove it from the table.
-    return RemoveHandle(handle);
+  // Do the name-map removal and Release OUTSIDE table_mutex_ (object destruction
+  // re-enters the global lock; name_mutex_ must not nest under table_mutex_).
+  if (to_release) {
+    if (!name_to_remove.empty()) {
+      RemoveNameMapping(name_to_remove);
+    }
+    to_release->Release();
   }
-
-  // FIXME: Return a status code telling the caller it wasn't released
-  // (but not a failure code)
-  return X_STATUS_SUCCESS;
+  return result;
 }
 
 X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
-  X_STATUS result = X_STATUS_SUCCESS;
+  XObject* to_release = nullptr;
+  std::string name_to_remove;
+  X_STATUS result;
+  {
+    std::unique_lock<std::shared_mutex> lock(table_mutex_);
+    result = RemoveHandleLocked(handle, &to_release, &name_to_remove);
+  }
+  if (to_release) {
+    if (!name_to_remove.empty()) {
+      RemoveNameMapping(name_to_remove);
+    }
+    to_release->Release();
+  }
+  return result;
+}
+
+// Assumes table_mutex_ is held EXCLUSIVELY. Detaches the object from the table but does
+// NOT Release it or remove its name mapping — those are returned via out params for the
+// caller to do after dropping the lock (see header note on the deadlock avoidance).
+X_STATUS ObjectTable::RemoveHandleLocked(X_HANDLE handle, XObject** out_release,
+                                         std::string* out_name) {
+  *out_release = nullptr;
 
   handle = TranslateHandle(handle);
   if (!handle) {
@@ -188,7 +231,6 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
     return X_STATUS_INVALID_HANDLE;
   }
 
-  auto global_lock = global_critical_region_.Acquire();
   if (entry->object) {
     auto object = entry->object;
     entry->object = nullptr;
@@ -203,19 +245,19 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
 
     REXSYS_DEBUG("Removed handle:{:08X} for {}", handle, typeid(*object).name());
 
-    // Remove object name from mapping to prevent naming collision.
+    // Capture the name now (object is still alive under the lock) so the caller can clear
+    // the name mapping after unlocking; defer the Release too.
     if (!object->name().empty()) {
-      RemoveNameMapping(object->name());
+      *out_name = object->name();
     }
-    // Release now that the object has been removed from the table.
-    object->Release();
+    *out_release = object;
   }
 
   return X_STATUS_SUCCESS;
 }
 
 std::vector<object_ref<XObject>> ObjectTable::GetAllObjects() {
-  auto lock = global_critical_region_.Acquire();
+  std::shared_lock<std::shared_mutex> lock(table_mutex_);
   std::vector<object_ref<XObject>> results;
 
   for (uint32_t slot = 0; slot < table_capacity_; slot++) {
@@ -230,25 +272,31 @@ std::vector<object_ref<XObject>> ObjectTable::GetAllObjects() {
 }
 
 void ObjectTable::PurgeAllObjects() {
-  auto lock = global_critical_region_.Acquire();
-  for (uint32_t slot = 0; slot < table_capacity_; slot++) {
-    auto& entry = table_[slot];
-    if (entry.object && !entry.object->is_host_object()) {
-      entry.handle_ref_count = 0;
-      entry.object->Release();
-
-      entry.object = nullptr;
+  // Collect victims under the lock, Release after unlocking (see RemoveHandle).
+  std::vector<XObject*> to_release;
+  {
+    std::unique_lock<std::shared_mutex> lock(table_mutex_);
+    for (uint32_t slot = 0; slot < table_capacity_; slot++) {
+      auto& entry = table_[slot];
+      if (entry.object && !entry.object->is_host_object()) {
+        entry.handle_ref_count = 0;
+        to_release.push_back(entry.object);
+        entry.object = nullptr;
+      }
     }
+  }
+  for (XObject* object : to_release) {
+    object->Release();
   }
 }
 
+// Assumes table_mutex_ is held (the only callers are writers holding it exclusively).
+// Returns a raw entry pointer that is valid ONLY while that lock is continuously held.
 ObjectTable::ObjectTableEntry* ObjectTable::LookupTable(X_HANDLE handle) {
   handle = TranslateHandle(handle);
   if (!handle) {
     return nullptr;
   }
-
-  auto global_lock = global_critical_region_.Acquire();
 
   // Lower 2 bits are ignored.
   uint32_t slot = GetHandleSlot(handle);
@@ -262,47 +310,43 @@ ObjectTable::ObjectTableEntry* ObjectTable::LookupTable(X_HANDLE handle) {
 // Generic lookup
 template <>
 object_ref<XObject> ObjectTable::LookupObject<XObject>(X_HANDLE handle) {
-  auto object = ObjectTable::LookupObject(handle, false);
+  auto object = ObjectTable::LookupObject(handle);
   auto result = object_ref<XObject>(reinterpret_cast<XObject*>(object));
   return result;
 }
 
-XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
+XObject* ObjectTable::LookupObject(X_HANDLE handle) {
   handle = TranslateHandle(handle);
   if (!handle) {
     return nullptr;
   }
 
   XObject* object = nullptr;
-  if (!already_locked) {
-    global_critical_region_.mutex().lock();
-  }
+  {
+    // SHARED lock: concurrent guest threads resolve handles in parallel. The table holds a
+    // reference on every live object (taken in AddHandle, dropped only in RemoveHandle under
+    // the EXCLUSIVE lock), so while we hold the shared lock the object cannot be destroyed,
+    // and Retain() (atomic) is safe to do concurrently.
+    std::shared_lock<std::shared_mutex> lock(table_mutex_);
 
-  // Lower 2 bits are ignored.
-  uint32_t slot = GetHandleSlot(handle);
+    // Lower 2 bits are ignored.
+    uint32_t slot = GetHandleSlot(handle);
 
-  // Verify slot.
-  if (slot < table_capacity_) {
-    ObjectTableEntry& entry = table_[slot];
-    if (entry.object) {
-      object = entry.object;
+    // Verify slot.
+    if (slot < table_capacity_) {
+      ObjectTableEntry& entry = table_[slot];
+      if (entry.object) {
+        object = entry.object;
+        object->Retain();
+      }
     }
-  }
-
-  // Retain the object pointer.
-  if (object) {
-    object->Retain();
-  }
-
-  if (!already_locked) {
-    global_critical_region_.mutex().unlock();
   }
 
   return object;
 }
 
 void ObjectTable::GetObjectsByType(XObject::Type type, std::vector<object_ref<XObject>>* results) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::shared_lock<std::shared_mutex> lock(table_mutex_);
   for (uint32_t slot = 0; slot < table_capacity_; ++slot) {
     auto& entry = table_[slot];
     if (entry.object) {
@@ -361,10 +405,10 @@ X_STATUS ObjectTable::GetObjectByName(const std::string_view name, X_HANDLE* out
   }
   *out_handle = handle;
 
-  // Retain under global lock via normal LookupObject path.
-  // The handle may have been removed between releasing name_mutex_ and
-  // acquiring global lock -- LookupObject returns nullptr in that case.
-  auto obj = LookupObject(handle, false);
+  // Retain via the normal LookupObject path (shared table lock).
+  // The handle may have been removed between releasing name_mutex_ and the lookup --
+  // LookupObject returns nullptr in that case.
+  auto obj = LookupObject(handle);
   if (obj) {
     obj->RetainHandle();
     obj->Release();
@@ -374,6 +418,7 @@ X_STATUS ObjectTable::GetObjectByName(const std::string_view name, X_HANDLE* out
 }
 
 bool ObjectTable::Save(stream::ByteStream* stream) {
+  std::shared_lock<std::shared_mutex> lock(table_mutex_);
   stream->Write<uint32_t>(table_capacity_);
   for (uint32_t i = 0; i < table_capacity_; i++) {
     auto& entry = table_[i];
@@ -384,7 +429,8 @@ bool ObjectTable::Save(stream::ByteStream* stream) {
 }
 
 bool ObjectTable::Restore(stream::ByteStream* stream) {
-  Resize(stream->Read<uint32_t>());
+  std::unique_lock<std::shared_mutex> lock(table_mutex_);
+  ResizeLocked(stream->Read<uint32_t>());
   for (uint32_t i = 0; i < table_capacity_; i++) {
     auto& entry = table_[i];
     // entry.object = nullptr;
@@ -395,6 +441,7 @@ bool ObjectTable::Restore(stream::ByteStream* stream) {
 }
 
 X_STATUS ObjectTable::RestoreHandle(X_HANDLE handle, XObject* object) {
+  std::unique_lock<std::shared_mutex> lock(table_mutex_);
   uint32_t slot = GetHandleSlot(handle);
   assert_true(table_capacity_ > slot);
 

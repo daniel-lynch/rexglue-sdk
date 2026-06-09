@@ -57,18 +57,22 @@ class global_critical_region {
  public:
   static std::recursive_mutex& mutex();
 
+  // [PERF] Instrumented acquire: counts acquisitions and accumulates host ticks spent
+  // BLOCKED acquiring the global lock (real contention). Acquire()/AcquireDirect() route
+  // through this. PerfAcquires()/PerfWaitTicks() read-and-reset the counters.
+  static std::unique_lock<std::recursive_mutex> AcquireTimed();
+  static uint64_t PerfAcquires();
+  static uint64_t PerfWaitTicks();
+  static void PerfDumpCallers();  // [GLOCK PROF] env BO_GLOCK_PROF=1
+
   // Acquires a lock on the global critical section.
   // Use this when keeping an instance is not possible. Otherwise, prefer
   // to keep an instance of global_critical_region near the members requiring
   // it to keep things readable.
-  static std::unique_lock<std::recursive_mutex> AcquireDirect() {
-    return std::unique_lock<std::recursive_mutex>(mutex());
-  }
+  static std::unique_lock<std::recursive_mutex> AcquireDirect() { return AcquireTimed(); }
 
   // Acquires a lock on the global critical section.
-  inline std::unique_lock<std::recursive_mutex> Acquire() {
-    return std::unique_lock<std::recursive_mutex>(mutex());
-  }
+  inline std::unique_lock<std::recursive_mutex> Acquire() { return AcquireTimed(); }
 
   // Acquires a deferred lock on the global critical section.
   inline std::unique_lock<std::recursive_mutex> AcquireDeferred() {
