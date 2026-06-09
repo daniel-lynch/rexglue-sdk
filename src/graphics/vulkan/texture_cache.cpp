@@ -1286,32 +1286,6 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   uint32_t depth_or_array_size = texture_key.GetDepthOrArraySize();
   uint32_t depth = is_3d ? depth_or_array_size : 1;
   uint32_t array_size = is_3d ? 1 : depth_or_array_size;
-
-  // RT->texture bridge: if this base level was just resolved from a color render
-  // target whose image still holds that content, copy it image-to-image and skip
-  // the guest-RAM upload entirely. Restricted to the trivially-correct case (full
-  // 2D surface, single layer, no mips, scale 1, uncompressed host format); the RT
-  // cache rejects anything that doesn't match exactly, in which case we fall
-  // through to the normal resident-memory upload below.
-  if (REXCVAR_GET(rt_texture_bridge) && load_base &&
-      dimension == xenos::DataDimension::k2DOrStacked && texture_key.mip_max_level == 0 &&
-      !texture_key.scaled_resolve && depth_or_array_size == 1 && !host_format.block_compressed) {
-    VulkanRenderTargetCache* rt_cache = command_processor_.render_target_cache();
-    if (rt_cache) {
-      VkPipelineStageFlags texture_cur_stage;
-      VkAccessFlags texture_cur_access;
-      VkImageLayout texture_cur_layout;
-      GetTextureUsageMasks(vulkan_texture.usage(), texture_cur_stage, texture_cur_access,
-                           texture_cur_layout);
-      if (rt_cache->TryBridgeResolvedColorToTexture(
-              texture_key.base_page << 12, width, height, host_format.format,
-              vulkan_texture.image(), texture_cur_stage, texture_cur_access, texture_cur_layout)) {
-        vulkan_texture.SetUsage(VulkanTexture::Usage::kTransferDestination);
-        vulkan_texture.MarkAsUsed();
-        return true;
-      }
-    }
-  }
   xenos::TextureFormat guest_format = texture_key.format;
   const FormatInfo* guest_format_info = FormatInfo::Get(guest_format);
   uint32_t block_width = guest_format_info->block_width;

@@ -147,10 +147,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
                           std::vector<uint32_t>& spirv_out, std::string& error_out) const;
 
-  // The host render target cache for the currently active path. May be used by
-  // the texture cache to bridge resolved render targets directly into textures.
-  VulkanRenderTargetCache* render_target_cache() const { return render_target_cache_.get(); }
-
   // Returns the deferred drawing command list for the currently open
   // submission.
   DeferredCommandBuffer& deferred_command_buffer() {

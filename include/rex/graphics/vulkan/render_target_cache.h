@@ -110,23 +110,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                VulkanTextureCache& texture_cache, uint32_t& written_address_out,
                uint32_t& written_length_out);
 
-  // RT->texture bridge (gated by the rt_texture_bridge cvar). If the guest
-  // texture at texture_base was just resolved from a color render target whose
-  // host image still holds that content (full surface, matching format, no
-  // scale/MSAA), records a direct vkCmdCopyImage from the render-target image
-  // into texture_image (transitioning both), skipping the guest-RAM round-trip,
-  // and returns true. Otherwise returns false (caller falls back to the normal
-  // resident-memory upload). texture_cur_* describe the texture image's current
-  // usage so the destination transition barrier can be emitted; on success the
-  // image is left in VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL (the same state the
-  // normal upload path leaves it in).
-  bool TryBridgeResolvedColorToTexture(uint32_t texture_base, uint32_t texture_width,
-                                       uint32_t texture_height, VkFormat texture_format,
-                                       VkImage texture_image,
-                                       VkPipelineStageFlags texture_cur_stage,
-                                       VkAccessFlags texture_cur_access,
-                                       VkImageLayout texture_cur_layout);
-
   // Returns true if any downloads were submitted to the command processor.
   bool InitializeTraceSubmitDownloads();
   void InitializeTraceCompleteDownloads();
@@ -387,12 +370,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t temporary_sort_index() const { return temporary_sort_index_; }
     void SetTemporarySortIndex(uint32_t index) { temporary_sort_index_ = index; }
 
-    // Monotonic counter bumped every time this render target is bound for
-    // drawing. Used by the RT->texture bridge to detect that the image was
-    // overwritten between a resolve and a later texture load (stale content).
-    uint64_t draw_generation() const { return draw_generation_; }
-    void MarkDrawn() { ++draw_generation_; }
-
    private:
     VulkanRenderTargetCache& render_target_cache_;
 
@@ -417,31 +394,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     // Temporary storage for indices in operations like transfers and dumps.
     uint32_t temporary_sort_index_ = 0;
-
-    uint64_t draw_generation_ = 0;
   };
-
-  // An entry in the RT->texture bridge side table: a guest range that was just
-  // resolved from a color render target, recorded only for the trivially-safe
-  // case (full surface at origin 0, scale 1, MSAA 1x). Keyed by the resolve
-  // destination guest base address. Cleared every submission and whenever any
-  // render target is destroyed, so render_target is always a live pointer.
-  struct ResolvedColorRT {
-    VulkanRenderTarget* render_target;
-    // render_target->draw_generation() captured at resolve time; if it differs
-    // at bridge time the image was redrawn since the resolve (stale).
-    uint64_t draw_generation;
-    uint32_t width;
-    uint32_t height;
-    VkFormat format;
-  };
-  std::unordered_map<uint32_t, ResolvedColorRT> resolved_color_rts_;
-
-  // Populates resolved_color_rts_ from the just-completed resolve if it is
-  // eligible for the bridge. dump_rectangles_ must hold the resolve's dumped
-  // render-target rectangles. No-op for ineligible resolves.
-  void RecordResolvedColorRT(const draw_util::ResolveInfo& resolve_info,
-                             bool draw_resolution_scaled);
 
   struct FramebufferKey {
     RenderPassKey render_pass_key;
