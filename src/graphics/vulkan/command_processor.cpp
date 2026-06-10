@@ -21,6 +21,12 @@
 #include <utility>
 #include <vector>
 
+#include <cstdio>          // [BO-SHOT] one-shot frontbuffer dump
+#include <rex/platform.h>  // REX_PLATFORM_WIN32 guards the POSIX-only SIGUSR1 fbdump trigger
+#if !REX_PLATFORM_WIN32
+#include <csignal>
+#endif
+
 #include <SPIRV/GlslangToSpv.h>
 #include <glslang/Public/ShaderLang.h>
 #include <rex/assert.h>
@@ -72,6 +78,25 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
 namespace rex::graphics::vulkan {
 
 namespace {
+
+// [BO-SHOT] On-demand one-shot frontbuffer capture — perf-free when idle. Send `kill -USR1
+// <pid>` (or tools/bo_shot.sh): the signal sets g_fbdump_request, the resolve path is forced
+// to copy the resolved frame back to guest RAM for the next few frames (even when
+// vulkan_readback_resolve is OFF), and IssueSwap dumps it to /tmp/wall6/fb_live.raw. Lets us
+// screenshot any moment WITHOUT leaving readback on. Also gives SIGUSR1 a handler so bo_shot's
+// `kill -USR1` no longer terminates the process (default disposition).
+std::atomic<int> g_fbdump_request{0};
+// [BO-SHOT] per-swap IssueDraw counter (reset each swap) — "is the scene actually drawing?".
+std::atomic<uint32_t> g_fbdump_draws{0};
+#if !REX_PLATFORM_WIN32
+void bo_fbdump_signal(int) { g_fbdump_request.store(3, std::memory_order_relaxed); }
+struct BoFbdumpInstaller {
+  BoFbdumpInstaller() { std::signal(SIGUSR1, bo_fbdump_signal); }
+};
+BoFbdumpInstaller g_bo_fbdump_installer;
+#endif  // !REX_PLATFORM_WIN32 (SIGUSR1 is POSIX-only)
+// True while a one-shot dump is pending; forces the resolve→guest-RAM copy for that frame.
+inline bool bo_fbdump_pending() { return g_fbdump_request.load(std::memory_order_relaxed) > 0; }
 
 // glslang default built-in resource limits.
 constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
@@ -2305,6 +2330,53 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     return;
   }
 
+  // [BO-SHOT] frontbuffer capture. On-demand via `kill -USR1` (g_fbdump_request), or continuous
+  // with BO_FBDUMP=1 (every 15th swap). Dumps the guest-RAM frontbuffer to /tmp/wall6/fb_live.raw
+  // + logs a sparse color summary (untile with tools/untile.py). The resolve→guest-RAM copy is
+  // forced while a dump is pending (see bo_fbdump_pending() in the readback-mode decision), so the
+  // dump is valid even with vulkan_readback_resolve OFF — and reading guest RAM here tells us
+  // whether the frame actually RENDERED, independent of the on-screen present path.
+  {
+    static const bool kFbDump = std::getenv("BO_FBDUMP") != nullptr;
+    static std::atomic<uint32_t> s_fbdump_swap{0};
+    uint32_t n = s_fbdump_swap.fetch_add(1);
+    int req = g_fbdump_request.load(std::memory_order_relaxed);
+    if (((kFbDump && (n % 15) == 0) || req > 0) && memory_ && frontbuffer_ptr) {
+      const uint8_t* hp = memory_->TranslatePhysical(frontbuffer_ptr);
+      if (hp) {
+        size_t px = size_t(frontbuffer_width) * size_t(frontbuffer_height);
+        if (FILE* f = std::fopen("/tmp/wall6/fb_live.raw", "wb")) {
+          std::fwrite(hp, 4, px, f);
+          std::fclose(f);
+        }
+        const uint32_t* p = reinterpret_cast<const uint32_t*>(hp);
+        uint64_t sr = 0, sg = 0, sb = 0;
+        uint32_t bright = 0, samples = 0;
+        for (size_t i = 0; i < px; i += 97) {  // sparse sample
+          uint32_t v = p[i];
+          uint8_t r = v & 0xFF, g = (v >> 8) & 0xFF, b = (v >> 16) & 0xFF;
+          sr += r;
+          sg += g;
+          sb += b;
+          if (r > 0xC0 && g > 0xC0 && b > 0xC0)
+            ++bright;
+          ++samples;
+        }
+        if (samples) {
+          std::fprintf(stderr,
+                       "[FBLIVE] swap#%u fb=0x%08X mean=(%u,%u,%u) bright%%=%u draws=%u%s\n", n,
+                       frontbuffer_ptr, uint32_t(sr / samples), uint32_t(sg / samples),
+                       uint32_t(sb / samples), 100 * bright / samples,
+                       g_fbdump_draws.exchange(0, std::memory_order_relaxed),
+                       req > 0 ? " [BO-SHOT one-shot -> /tmp/wall6/fb_live.raw]" : "");
+          std::fflush(stderr);
+        }
+      }
+    }
+    if (req > 0)
+      g_fbdump_request.fetch_sub(1, std::memory_order_relaxed);
+  }
+
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
@@ -3610,6 +3682,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  g_fbdump_draws.fetch_add(1, std::memory_order_relaxed);  // [BO-SHOT] per-swap draw count
+
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
   auto draw_fail = [&](const char* stage) {
@@ -4613,7 +4687,8 @@ bool VulkanCommandProcessor::IssueCopy() {
     return false;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  ReadbackResolveMode readback_mode =
+      GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve) || bo_fbdump_pending());
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
@@ -4642,7 +4717,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  ReadbackResolveMode readback_mode =
+      GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve) || bo_fbdump_pending());
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     return true;
   }
