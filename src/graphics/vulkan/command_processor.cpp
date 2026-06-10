@@ -1958,6 +1958,9 @@ void VulkanCommandProcessor::ShutdownContext() {
     }
   }
   memexport_readback_buffers_.clear();
+  ShutdownMemexportReadbackBatches();
+  occlusion_queries_pending_.clear();
+  occlusion_last_samples_.clear();
 
   resolve_downscale_buffer_size_ = 0;
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, resolve_downscale_buffer_);
@@ -4578,7 +4581,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       memexport_total_size += memexport_range.size_bytes;
     }
     if (memexport_total_size) {
-      if (REXCVAR_GET(readback_memexport_fast)) {
+      if (REXCVAR_GET(readback_deferred)) {
+        IssueDraw_MemexportReadbackDeferred(memexport_total_size);
+      } else if (REXCVAR_GET(readback_memexport_fast)) {
         IssueDraw_MemexportReadbackFastPath(memexport_total_size);
       } else {
         IssueDraw_MemexportReadbackFullPath(memexport_total_size);
@@ -4787,6 +4792,211 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
 
   readback.current_index = read_index;
   return true;
+}
+
+bool VulkanCommandProcessor::EnsureMemexportReadbackBatchCapacity(MemexportReadbackBatch& batch,
+                                                                  uint32_t capacity) {
+  if (batch.buffer != VK_NULL_HANDLE && capacity <= batch.capacity) {
+    return true;
+  }
+  if (!capacity) {
+    return batch.buffer != VK_NULL_HANDLE;
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  const uint32_t new_capacity = AlignReadbackBufferSize(std::max(capacity, batch.capacity));
+  VkBuffer new_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory new_memory = VK_NULL_HANDLE;
+  uint32_t new_memory_type = UINT32_MAX;
+  VkDeviceSize new_memory_size = 0;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, new_capacity, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, new_buffer, new_memory, &new_memory_type,
+          &new_memory_size)) {
+    return false;
+  }
+  void* new_mapping = nullptr;
+  if (dfn.vkMapMemory(device, new_memory, 0, VK_WHOLE_SIZE, 0, &new_mapping) != VK_SUCCESS) {
+    dfn.vkDestroyBuffer(device, new_buffer, nullptr);
+    dfn.vkFreeMemory(device, new_memory, nullptr);
+    return false;
+  }
+  // Only ever called for an idle batch (frame advance), so the old buffer's last
+  // submission has already completed - free it immediately.
+  if (batch.buffer != VK_NULL_HANDLE) {
+    if (batch.mapped) {
+      dfn.vkUnmapMemory(device, batch.memory);
+    }
+    dfn.vkDestroyBuffer(device, batch.buffer, nullptr);
+    dfn.vkFreeMemory(device, batch.memory, nullptr);
+  }
+  batch.buffer = new_buffer;
+  batch.memory = new_memory;
+  batch.mapped = new_mapping;
+  batch.capacity = new_capacity;
+  batch.memory_type = new_memory_type;
+  batch.memory_size = new_memory_size;
+  batch.host_coherent =
+      (vulkan_device->memory_types().host_coherent & (uint32_t(1) << new_memory_type)) != 0;
+  return true;
+}
+
+void VulkanCommandProcessor::ApplyMemexportReadbackBatch(MemexportReadbackBatch& batch) {
+  if (batch.ranges.empty() || !batch.mapped) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (!batch.host_coherent) {
+    VkMappedMemoryRange memory_range = {};
+    memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    memory_range.memory = batch.memory;
+    memory_range.offset = 0;
+    memory_range.size = std::min(
+        rex::round_up(VkDeviceSize(batch.used), vulkan_device->properties().nonCoherentAtomSize),
+        batch.memory_size);
+    dfn.vkInvalidateMappedMemoryRanges(device, 1, &memory_range);
+  }
+  const uint8_t* mapped = reinterpret_cast<const uint8_t*>(batch.mapped);
+  for (const MemexportReadbackBatch::Range& range : batch.ranges) {
+    std::memcpy(memory_->TranslatePhysical(range.guest_address), mapped + range.buffer_offset,
+                range.size);
+  }
+}
+
+void VulkanCommandProcessor::DrainCompletedMemexportBatches() {
+  for (MemexportReadbackBatch& batch : memexport_readback_batches_) {
+    if (batch.submission && batch.submission <= submission_completed_) {
+      ApplyMemexportReadbackBatch(batch);
+      batch.submission = 0;
+      batch.used = 0;
+      batch.ranges.clear();
+    }
+  }
+}
+
+void VulkanCommandProcessor::AdvanceMemexportReadbackFrame() {
+  memexport_readback_batch_index_ =
+      (memexport_readback_batch_index_ + 1) % kMemexportReadbackBatchCount;
+  MemexportReadbackBatch& batch = memexport_readback_batches_[memexport_readback_batch_index_];
+  // Safety valve: with a ring of kMaxFramesInFlight + 1 advanced once per frame the
+  // target should always be idle, but if it somehow isn't, apply it with a one-time
+  // blocking wait rather than overwriting an in-flight buffer.
+  if (batch.submission) {
+    if (batch.submission > submission_completed_) {
+      CheckSubmissionFenceAndDeviceLoss(batch.submission);
+    }
+    ApplyMemexportReadbackBatch(batch);
+    batch.submission = 0;
+  }
+  batch.used = 0;
+  batch.ranges.clear();
+  if (memexport_readback_capacity_target_) {
+    EnsureMemexportReadbackBatchCapacity(batch, memexport_readback_capacity_target_);
+  }
+}
+
+bool VulkanCommandProcessor::IssueDraw_MemexportReadbackDeferred(uint32_t total_size) {
+  if (!total_size || memexport_ranges_.empty()) {
+    return true;
+  }
+
+  MemexportReadbackBatch& batch = memexport_readback_batches_[memexport_readback_batch_index_];
+  const uint32_t frame_total = batch.used + total_size;
+  // Grow next frame's batch to hold this frame's peak memexport volume.
+  if (frame_total > memexport_readback_capacity_target_) {
+    memexport_readback_capacity_target_ = AlignReadbackBufferSize(frame_total);
+  }
+  // If the batch can't hold this draw (first frame, or a bigger burst than the
+  // batch was grown for), fall back to the blocking full path for this draw only.
+  // The capacity target above makes the next frame's batch big enough.
+  if (batch.buffer == VK_NULL_HANDLE || frame_total > batch.capacity) {
+    return IssueDraw_MemexportReadbackFullPath(total_size);
+  }
+
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  SubmitBarriers(true);
+
+  uint32_t local_offset = batch.used;
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    const uint32_t guest_address = memexport_range.base_address_dwords << 2;
+    VkBufferCopy readback_region = {};
+    readback_region.srcOffset = guest_address;
+    readback_region.dstOffset = local_offset;
+    readback_region.size = memexport_range.size_bytes;
+    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), batch.buffer, 1,
+                                             &readback_region);
+    batch.ranges.push_back({guest_address, local_offset, memexport_range.size_bytes});
+    local_offset += memexport_range.size_bytes;
+  }
+  PushBufferMemoryBarrier(batch.buffer, batch.used, total_size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT);
+  batch.used = frame_total;
+  batch.submission = GetCurrentSubmission();
+  return true;
+}
+
+void VulkanCommandProcessor::ShutdownMemexportReadbackBatches() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  for (MemexportReadbackBatch& batch : memexport_readback_batches_) {
+    if (batch.mapped && batch.memory != VK_NULL_HANDLE) {
+      dfn.vkUnmapMemory(device, batch.memory);
+    }
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, batch.buffer);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, batch.memory);
+    batch.mapped = nullptr;
+    batch.capacity = 0;
+    batch.memory_size = 0;
+    batch.submission = 0;
+    batch.used = 0;
+    batch.ranges.clear();
+  }
+  memexport_readback_batch_index_ = 0;
+  memexport_readback_capacity_target_ = 0;
+}
+
+void VulkanCommandProcessor::DrainCompletedOcclusionQueries() {
+  if (occlusion_queries_pending_.empty() || occlusion_query_readback_mapping_ == nullptr) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const bool host_coherent =
+      (vulkan_device->memory_types().host_coherent &
+       (uint32_t(1) << occlusion_query_readback_memory_type_)) != 0;
+  bool invalidated = false;
+  // FIFO by submission (push_back in submission order), so stop at the first
+  // still-in-flight query.
+  while (!occlusion_queries_pending_.empty()) {
+    const DeferredOcclusionQuery& query = occlusion_queries_pending_.front();
+    if (query.submission > submission_completed_) {
+      break;
+    }
+    if (!host_coherent && !invalidated) {
+      VkMappedMemoryRange memory_range = {};
+      memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+      memory_range.memory = occlusion_query_readback_memory_;
+      memory_range.offset = 0;
+      memory_range.size =
+          std::min(rex::round_up(VkDeviceSize(sizeof(uint64_t) * kMaxOcclusionQueries),
+                                 vulkan_device->properties().nonCoherentAtomSize),
+                   occlusion_query_readback_memory_size_);
+      dfn.vkInvalidateMappedMemoryRanges(device, 1, &memory_range);
+      invalidated = true;
+    }
+    const uint64_t* results = reinterpret_cast<const uint64_t*>(occlusion_query_readback_mapping_);
+    occlusion_last_samples_[query.sample_count_address] =
+        NormalizeOcclusionSamples(results[query.host_index]);
+    occlusion_queries_pending_.pop_front();
+  }
 }
 
 bool VulkanCommandProcessor::IssueCopy() {
@@ -5238,6 +5448,9 @@ void VulkanCommandProcessor::DisableHostOcclusionQueries() {
   active_occlusion_query_ = {};
   occlusion_query_cursor_ = 0;
   occlusion_query_resources_available_ = false;
+  // The cursor reset invalidates outstanding host indices; drop any deferred
+  // results that haven't been scattered back yet.
+  occlusion_queries_pending_.clear();
 }
 
 bool VulkanCommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_address) {
@@ -5293,6 +5506,21 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
                                            occlusion_query_readback_buffer_,
                                            sizeof(uint64_t) * host_index, sizeof(uint64_t),
                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+
+  if (REXCVAR_GET(readback_deferred)) {
+    // Don't end the submission or drain the GPU. The WAIT_BIT above keeps the copy
+    // GPU-side-ordered after the query result is available; the host result is
+    // scattered back a frame later in DrainCompletedOcclusionQueries(). Return the
+    // last completed sample count for this address (or the fake fallback).
+    occlusion_queries_pending_.push_back({host_index, sample_count_address,
+                                          GetCurrentSubmission()});
+    auto it = occlusion_last_samples_.find(sample_count_address);
+    uint64_t deferred_samples = it != occlusion_last_samples_.end()
+                                    ? it->second
+                                    : uint64_t(REXCVAR_GET(query_occlusion_fake_sample_count));
+    WriteGuestOcclusionResult(sample_count_address, deferred_samples);
+    return true;
+  }
 
   if (!EndSubmission(false)) {
     return false;
@@ -5563,6 +5791,15 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
         break;
       }
       frame_completed_ = frame;
+    }
+
+    // [readback_deferred] Scatter back any readbacks whose submissions have now
+    // completed, then rotate the memexport batch ring for the new frame. Never
+    // blocks (submission_completed_ was just refreshed above).
+    if (REXCVAR_GET(readback_deferred)) {
+      DrainCompletedMemexportBatches();
+      AdvanceMemexportReadbackFrame();
+      DrainCompletedOcclusionQueries();
     }
   }
 
