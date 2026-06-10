@@ -961,6 +961,20 @@ static void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
   pcr->current_irql = new_irql;
 }
 
+// Per host-thread record of guest spinlocks currently held by this thread. Each held
+// spinlock corresponds to exactly one global_critical_region recursion and (optionally)
+// one raised IRQL. The stack lets a non-local exit (Com_Error longjmp) release them in
+// LIFO order via xeReleaseHeldSpinLocksForNonLocalExit. Guest spinlocks are a cold path
+// (a few acquisitions per frame), so the bookkeeping cost is negligible.
+namespace {
+struct HeldSpinLock {
+  X_KSPINLOCK* lock;
+  uint32_t old_irql;
+  bool change_irql;
+};
+thread_local std::vector<HeldSpinLock> t_held_spinlocks;
+}  // namespace
+
 // Guest-memory spinlock helpers - store PCR address as owner (matching xenia).
 // PPCContext* provides r13 (PCR address) without needing XThread::GetCurrentThread().
 uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_irql) {
@@ -980,6 +994,7 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_i
   while (!rex::thread::atomic_cas(0u, rex::byte_swap(pcr_addr), &lock->prcb_of_owner.value)) {
     rex::thread::MaybeYield();
   }
+  t_held_spinlocks.push_back({lock, old_irql, change_irql});
   return old_irql;
 }
 
@@ -992,6 +1007,40 @@ void xeKeKfReleaseSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, uint32_t old_irql
   rex::thread::global_critical_region::mutex().unlock();
   if (change_irql && old_irql < IRQL_DISPATCH) {
     xeKfLowerIrql(ctx, static_cast<unsigned char>(old_irql));
+  }
+  // Keep the per-thread held-lock stack balanced. Spinlocks are normally strictly
+  // nested (LIFO), so the match is almost always the top; tolerate the rare out-of-order
+  // release by erasing the most recent matching entry.
+  if (!t_held_spinlocks.empty() && t_held_spinlocks.back().lock == lock) {
+    t_held_spinlocks.pop_back();
+  } else {
+    for (auto it = t_held_spinlocks.rbegin(); it != t_held_spinlocks.rend(); ++it) {
+      if (it->lock == lock) {
+        t_held_spinlocks.erase(std::next(it).base());
+        break;
+      }
+    }
+  }
+}
+
+void xeReleaseHeldSpinLocksForNonLocalExit(PPCContext* ctx) {
+  // The engine's Com_Error setjmp/longjmp (BO sub_825FB7A0) abandons the current guest
+  // call stack without running the matching KfReleaseSpinLock for any spinlock held at
+  // the error site. Release them here, in LIFO order, so the recursive global lock is
+  // rebalanced, owner fields cleared, and IRQL restored. Empty stack -> no-op (the
+  // common case: most longjmps hold no spinlock).
+  while (!t_held_spinlocks.empty()) {
+    HeldSpinLock held = t_held_spinlocks.back();
+    t_held_spinlocks.pop_back();
+    rex::thread::atomic_store_release(0u, &held.lock->prcb_of_owner.value);
+    rex::thread::global_critical_region::mutex().unlock();
+    if (held.change_irql && held.old_irql < IRQL_DISPATCH) {
+      xeKfLowerIrql(ctx, static_cast<unsigned char>(held.old_irql));
+    }
+    REXKRNL_WARN(
+        "Released a guest spinlock abandoned by a Com_Error longjmp (owner field {:08X}); "
+        "rebalanced global critical region",
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(held.lock)));
   }
 }
 
@@ -1084,6 +1133,7 @@ u32 KeTryToAcquireSpinLockAtRaisedIrql_entry(mapped_u32 lock_ptr) {
     rex::thread::global_critical_region::mutex().unlock();
     return 0;
   }
+  t_held_spinlocks.push_back({lock, 0u, false});
   return 1;
 }
 

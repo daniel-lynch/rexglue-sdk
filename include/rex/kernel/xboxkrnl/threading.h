@@ -35,6 +35,15 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, rex::X_KSPINLOCK* lock, bool cha
 void xeKeKfReleaseSpinLock(PPCContext* ctx, rex::X_KSPINLOCK* lock, uint32_t old_irql,
                            bool change_irql = true);
 
+// Release every guest spinlock the CURRENT host thread holds, rebalancing the global
+// critical region and restoring IRQL. Call this immediately before an engine non-local
+// exit (idTech-style Com_Error setjmp/longjmp, e.g. BO sub_825FB7A0) transfers control
+// back to its setjmp site: the longjmp unwinds the guest stack without running the
+// matching KfReleaseSpinLock, which would otherwise leak the recursive global lock and
+// leave stale spinlock owner fields -> the next interrupt that takes one of those
+// spinlocks spins forever while holding the global lock, deadlocking the emulator.
+void xeReleaseHeldSpinLocksForNonLocalExit(PPCContext* ctx);
+
 // Guest-memory APC helpers
 void xeKeInitializeApc(rex::system::XAPC* apc, uint32_t thread_ptr, uint32_t kernel_routine,
                        uint32_t rundown_routine, uint32_t normal_routine, uint32_t apc_mode,
