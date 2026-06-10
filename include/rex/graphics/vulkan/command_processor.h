@@ -459,6 +459,42 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
   };
+  // [readback_deferred] Non-blocking memexport readback. A small ring of pooled,
+  // key-agnostic batch buffers. All memexport draws in one frame copy into the
+  // same batch (one submission); the scatter-back to guest RAM happens 1-2 frames
+  // later once that submission has completed - never blocking the CP thread.
+  struct MemexportReadbackBatch {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    uint32_t capacity = 0;
+    uint32_t memory_type = UINT32_MAX;
+    VkDeviceSize memory_size = 0;
+    bool host_coherent = false;
+    uint64_t submission = 0;  // Last submission that wrote this batch; 0 = idle/applied.
+    uint32_t used = 0;        // Bytes written into the buffer in the current frame.
+    struct Range {
+      uint32_t guest_address;  // Byte address in guest RAM to scatter back to.
+      uint32_t buffer_offset;  // Offset within the batch buffer.
+      uint32_t size;
+    };
+    std::vector<Range> ranges;
+  };
+  // = kMaxFramesInFlight + 1 (declared late) so the write target is always idle.
+  static constexpr uint32_t kMemexportReadbackBatchCount = 4;
+  bool IssueDraw_MemexportReadbackDeferred(uint32_t total_size);
+  bool EnsureMemexportReadbackBatchCapacity(MemexportReadbackBatch& batch, uint32_t capacity);
+  void ApplyMemexportReadbackBatch(MemexportReadbackBatch& batch);
+  void DrainCompletedMemexportBatches();
+  void AdvanceMemexportReadbackFrame();
+  void ShutdownMemexportReadbackBatches();
+  // [readback_deferred] Deferred occlusion query results.
+  void DrainCompletedOcclusionQueries();
+  struct DeferredOcclusionQuery {
+    uint32_t host_index;
+    uint32_t sample_count_address;
+    uint64_t submission;
+  };
   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
   static constexpr size_t kMaxReadbackBuffers = 256;
@@ -755,6 +791,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t vertex_buffers_in_sync_[2] = {};
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+
+  // [readback_deferred] Memexport batch ring + deferred-occlusion state.
+  MemexportReadbackBatch memexport_readback_batches_[kMemexportReadbackBatchCount];
+  uint32_t memexport_readback_batch_index_ = 0;
+  uint32_t memexport_readback_capacity_target_ = 0;  // Peak per-frame bytes seen.
+  std::deque<DeferredOcclusionQuery> occlusion_queries_pending_;
+  std::unordered_map<uint32_t, uint64_t> occlusion_last_samples_;
 
   // The current dynamic state of the graphics pipeline bind point. Note that
   // binding any pipeline to the bind point with static state (even if it's

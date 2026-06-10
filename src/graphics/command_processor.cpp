@@ -69,6 +69,14 @@ REXCVAR_DEFINE_BOOL(readback_memexport_fast, true, "GPU",
                     "automatic fallback to full synchronous readback")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(readback_deferred, false, "GPU",
+                    "Apply memexport and occlusion-query GPU->CPU readbacks without blocking "
+                    "the command processor on a full GPU drain. Results are scattered back to "
+                    "guest RAM 1-2 frames late from a pooled, submission-tracked buffer ring. "
+                    "Keeps the data (unlike readback_memexport=false) while removing the "
+                    "per-item stall. (Vulkan backend.)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
                      "Fake sample count for occlusion queries")
     .range(1, 100000)
