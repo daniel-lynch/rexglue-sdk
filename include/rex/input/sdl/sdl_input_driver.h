@@ -47,6 +47,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
  private:
   struct ControllerState {
     SDL_Gamepad* sdl;
+    SDL_JoystickID instance_id;  // cached so the event path needs no SDL calls
     X_INPUT_CAPABILITIES caps;
     X_INPUT_STATE state;
     bool state_changed;

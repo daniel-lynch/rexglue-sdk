@@ -82,6 +82,14 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
           },
           this);
 
+      // Drain the joystick device on SDL's own background thread so input is not
+      // hostage to our UI-thread pump cadence (which stalled after a couple of
+      // events on headless Linux). Pairs with the instance-id cache in
+      // GetControllerIndexFromInstanceID: with this thread dispatching events
+      // concurrently, the event path must take NO SDL locks while holding
+      // controllers_mutex_ or the two lock orders invert and deadlock.
+      SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
+
       // Initialize game controller subsystem
       if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         REXLOG_ERROR("SDL: Failed to init gamecontroller subsystem: {}", SDL_GetError());
@@ -473,6 +481,9 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   if (user_id >= 0) {
     auto& state = controllers_.at(user_id);
     state = {controller, {}};
+    // Cache the joystick instance id so per-event lookups need no SDL calls
+    // (avoids holding controllers_mutex_ while taking SDL's joystick lock).
+    state.instance_id = SDL_GetJoystickID(SDL_GetGamepadJoystick(controller));
     // XInput seems to start with packet_number = 1 .
     state.state_changed = true;
     UpdateXCapabilities(state);
@@ -591,17 +602,11 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
 }
 
 std::optional<size_t> SDLInputDriver::GetControllerIndexFromInstanceID(SDL_JoystickID instance_id) {
-  // Loop through our controllers and try to match the given ID.
+  // Match against the cached instance id. Deliberately makes NO SDL calls so it
+  // is safe to call while holding controllers_mutex_ (the SDL joystick lock is
+  // held by SDL's own joystick thread when it dispatches events to us).
   for (size_t i = 0; i < controllers_.size(); i++) {
-    auto controller = controllers_.at(i).sdl;
-    if (!controller) {
-      continue;
-    }
-    auto joystick = SDL_GetGamepadJoystick(controller);
-    assert(joystick);
-    auto joy_instance_id = SDL_GetJoystickID(joystick);
-    assert(joy_instance_id >= 0);
-    if (joy_instance_id == instance_id) {
+    if (controllers_.at(i).sdl && controllers_.at(i).instance_id == instance_id) {
       return i;
     }
   }
