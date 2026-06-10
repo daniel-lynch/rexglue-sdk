@@ -86,13 +86,28 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, 
   if (level == 0xFFFF) {
     host_level = SOL_SOCKET;
     switch (optname) {
-      case 0x0004: host_opt = SO_REUSEADDR; break;
-      case 0x0008: host_opt = SO_KEEPALIVE; break;
-      case 0x0010: host_opt = SO_DONTROUTE; break;
-      case 0x0020: host_opt = SO_BROADCAST; broadcast_socket_ = true; break;
-      case 0x0100: host_opt = SO_OOBINLINE; break;
-      case 0x1001: host_opt = SO_SNDBUF; break;
-      case 0x1002: host_opt = SO_RCVBUF; break;
+      case 0x0004:
+        host_opt = SO_REUSEADDR;
+        break;
+      case 0x0008:
+        host_opt = SO_KEEPALIVE;
+        break;
+      case 0x0010:
+        host_opt = SO_DONTROUTE;
+        break;
+      case 0x0020:
+        host_opt = SO_BROADCAST;
+        broadcast_socket_ = true;
+        break;
+      case 0x0100:
+        host_opt = SO_OOBINLINE;
+        break;
+      case 0x1001:
+        host_opt = SO_SNDBUF;
+        break;
+      case 0x1002:
+        host_opt = SO_RCVBUF;
+        break;
       default:
         // Unsupported/struct-shaped (e.g. SO_LINGER) or title-specific option;
         // accept silently rather than failing the net subsystem.

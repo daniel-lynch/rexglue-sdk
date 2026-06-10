@@ -775,4 +775,4 @@ extern "C" REX_FUNC(__imp__RtlUnwind) {
   ctx.r3.u64 = ctx.r6.u64;
 }
 static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlUnwind("__imp__RtlUnwind",
-                                                               &__imp__RtlUnwind);
+                                                                    &__imp__RtlUnwind);

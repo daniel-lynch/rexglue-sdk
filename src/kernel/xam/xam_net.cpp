@@ -53,17 +53,28 @@ using namespace rex::system::xam;
 // callers treat "no data yet" as benign instead of a fatal socket error.
 static uint32_t PosixErrnoToWsa(int e) {
   switch (e) {
-    case EWOULDBLOCK:   return 10035;  // WSAEWOULDBLOCK (== EAGAIN on Linux)
-    case EINPROGRESS:   return 10036;  // WSAEINPROGRESS
-    case EALREADY:      return 10037;  // WSAEALREADY
-    case ENOTSOCK:      return 10038;  // WSAENOTSOCK
-    case EMSGSIZE:      return 10040;  // WSAEMSGSIZE
-    case EADDRINUSE:    return 10048;  // WSAEADDRINUSE
-    case EADDRNOTAVAIL: return 10049;  // WSAEADDRNOTAVAIL
-    case ECONNRESET:    return 10054;  // WSAECONNRESET
-    case ETIMEDOUT:     return 10060;  // WSAETIMEDOUT
-    case ECONNREFUSED:  return 10061;  // WSAECONNREFUSED
-    default:            return 10035;  // default to WOULDBLOCK so callers retry
+    case EWOULDBLOCK:
+      return 10035;  // WSAEWOULDBLOCK (== EAGAIN on Linux)
+    case EINPROGRESS:
+      return 10036;  // WSAEINPROGRESS
+    case EALREADY:
+      return 10037;  // WSAEALREADY
+    case ENOTSOCK:
+      return 10038;  // WSAENOTSOCK
+    case EMSGSIZE:
+      return 10040;  // WSAEMSGSIZE
+    case EADDRINUSE:
+      return 10048;  // WSAEADDRINUSE
+    case EADDRNOTAVAIL:
+      return 10049;  // WSAEADDRNOTAVAIL
+    case ECONNRESET:
+      return 10054;  // WSAECONNRESET
+    case ETIMEDOUT:
+      return 10060;  // WSAETIMEDOUT
+    case ECONNREFUSED:
+      return 10061;  // WSAECONNREFUSED
+    default:
+      return 10035;  // default to WOULDBLOCK so callers retry
   }
 }
 #endif

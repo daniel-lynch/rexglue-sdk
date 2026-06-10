@@ -118,8 +118,8 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   if (input_state) {
     uint16_t b = input_state->gamepad.buttons;
     int16_t lx = input_state->gamepad.thumb_lx, ly = input_state->gamepad.thumb_ly;
-    if (b || input_state->gamepad.left_trigger || input_state->gamepad.right_trigger ||
-        lx > 8000 || lx < -8000 || ly > 8000 || ly < -8000) {
+    if (b || input_state->gamepad.left_trigger || input_state->gamepad.right_trigger || lx > 8000 ||
+        lx < -8000 || ly > 8000 || ly < -8000) {
       static std::atomic<int> n{0};
       if (n.fetch_add(1) < 120)
         REXKRNL_WARN("[INPUTDBG] user={} buttons=0x{:04X} lt={} rt={} lx={} ly={}",

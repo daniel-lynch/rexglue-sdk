@@ -438,8 +438,7 @@ u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
       // FILE_DEVICE_UNKNOWN with no characteristics makes them retry forever.
       info->device_type = FILE_DEVICE_DISK;
       info->characteristics = FILE_DEVICE_IS_MOUNTED;
-      REXKRNL_DEBUG("XFileFsDeviceInformation: device='{}' -> type=DISK, mounted",
-                    dev_name);
+      REXKRNL_DEBUG("XFileFsDeviceInformation: device='{}' -> type=DISK, mounted", dev_name);
       out_length = sizeof(X_FILE_FS_DEVICE_INFORMATION);
       break;
     }

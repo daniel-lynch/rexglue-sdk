@@ -37,11 +37,11 @@ namespace rex::system {
 
 namespace {
 // [BO-PERF] runtime A/B toggle for the lock-free GetNativeObject fast path (measurement only —
-// STRIP before upstream). Default ON (lock-free). `kill -USR2 <pid>` flips it so the SAME held-still
-// scene can be measured lock-free vs the old shared_lock path back-to-back in ONE process, removing
-// run-to-run variance. Safe to flip live: StashHandle always runs under the exclusive lock and
-// publishes via release store, so a lock-free reader pairs via acquire and a shared reader is
-// mutex-excluded, in either mode and across a flip.
+// STRIP before upstream). Default ON (lock-free). `kill -USR2 <pid>` flips it so the SAME
+// held-still scene can be measured lock-free vs the old shared_lock path back-to-back in ONE
+// process, removing run-to-run variance. Safe to flip live: StashHandle always runs under the
+// exclusive lock and publishes via release store, so a lock-free reader pairs via acquire and a
+// shared reader is mutex-excluded, in either mode and across a flip.
 std::atomic<bool> g_native_lockfree{true};
 #if !REX_PLATFORM_WIN32
 void bo_native_toggle(int) {

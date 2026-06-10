@@ -89,14 +89,18 @@ std::atomic<int> g_fbdump_request{0};
 // [BO-SHOT] per-swap IssueDraw counter (reset each swap) — "is the scene actually drawing?".
 std::atomic<uint32_t> g_fbdump_draws{0};
 #if !REX_PLATFORM_WIN32
-void bo_fbdump_signal(int) { g_fbdump_request.store(3, std::memory_order_relaxed); }
+void bo_fbdump_signal(int) {
+  g_fbdump_request.store(3, std::memory_order_relaxed);
+}
 struct BoFbdumpInstaller {
   BoFbdumpInstaller() { std::signal(SIGUSR1, bo_fbdump_signal); }
 };
 BoFbdumpInstaller g_bo_fbdump_installer;
 #endif  // !REX_PLATFORM_WIN32 (SIGUSR1 is POSIX-only)
 // True while a one-shot dump is pending; forces the resolve→guest-RAM copy for that frame.
-inline bool bo_fbdump_pending() { return g_fbdump_request.load(std::memory_order_relaxed) > 0; }
+inline bool bo_fbdump_pending() {
+  return g_fbdump_request.load(std::memory_order_relaxed) > 0;
+}
 
 // glslang default built-in resource limits.
 constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
@@ -4648,9 +4652,8 @@ void VulkanCommandProcessor::DrainCompletedOcclusionQueries() {
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-  const bool host_coherent =
-      (vulkan_device->memory_types().host_coherent &
-       (uint32_t(1) << occlusion_query_readback_memory_type_)) != 0;
+  const bool host_coherent = (vulkan_device->memory_types().host_coherent &
+                              (uint32_t(1) << occlusion_query_readback_memory_type_)) != 0;
   bool invalidated = false;
   // FIFO by submission (push_back in submission order), so stop at the first
   // still-in-flight query.
@@ -5190,8 +5193,8 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
     // GPU-side-ordered after the query result is available; the host result is
     // scattered back a frame later in DrainCompletedOcclusionQueries(). Return the
     // last completed sample count for this address (or the fake fallback).
-    occlusion_queries_pending_.push_back({host_index, sample_count_address,
-                                          GetCurrentSubmission()});
+    occlusion_queries_pending_.push_back(
+        {host_index, sample_count_address, GetCurrentSubmission()});
     auto it = occlusion_last_samples_.find(sample_count_address);
     uint64_t deferred_samples = it != occlusion_last_samples_.end()
                                     ? it->second

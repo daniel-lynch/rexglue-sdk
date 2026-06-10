@@ -476,9 +476,8 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
     if (uint32_t(texture_format) != s_last_fmt || color_space != s_last_cs) {
       s_last_fmt = uint32_t(texture_format);
       s_last_cs = color_space;
-      REXKRNL_WARN("[BO-SWAP] frontbuffer format={} color_space={} {}x{}",
-                   uint32_t(texture_format), uint32_t(color_space), uint32_t(*width),
-                   uint32_t(*height));
+      REXKRNL_WARN("[BO-SWAP] frontbuffer format={} color_space={} {}x{}", uint32_t(texture_format),
+                   uint32_t(color_space), uint32_t(*width), uint32_t(*height));
     }
   }
   assert_true(texture_format == rex::graphics::xenos::TextureFormat::k_8_8_8_8 ||
