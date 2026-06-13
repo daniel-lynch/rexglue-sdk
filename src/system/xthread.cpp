@@ -1428,6 +1428,15 @@ void XHostThread::Execute() {
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);
 
+  // [BO-RACE-FIX] upstream PR #309 / issue #316: match XThread::Execute and initialize the host's FP
+  // exception mask + rounding/flush state so PPC FP ops dispatched on this host worker thread (audio,
+  // GPU commands, etc.) via FunctionDispatcher::Execute don't (a) trap on inexact/denormal results PPC
+  // masks, or (b) compute with a stale inherited MXCSR — a thread/scheduling-dependent FP divergence
+  // that fits the layout-sensitive white-menu bloom race AND the taskset intro FP crash.
+  if (auto* ctx = thread_state_->context()) {
+    ctx->fpscr.InitHost();
+  }
+
   int ret = host_fn_();
 
   // Exit.
