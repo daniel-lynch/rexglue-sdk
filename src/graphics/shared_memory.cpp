@@ -135,6 +135,16 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
     return;
   }
 
+  // [BO-RACE-FIX] Snapshot the page-validity bitmap under the global lock.
+  // MemoryInvalidationCallback() clears bits in system_page_flags_valid_and_gpu_written_
+  // while holding global_critical_region_; doing this dirty_blocks_/memcpy snapshot
+  // lock-free reads a TORN bitmap -> a stale active_valid_flags_ -> the swap decode
+  // reuses a stale (white) buffer instead of re-reading fresh guest RAM = the v0.8.0
+  // white menu. TSan-proven race (shared_memory.cpp:153 memcpy vs :635 callback).
+  // The staging/active pointer double-buffer stays lock-free; only the source-array
+  // read needs to be consistent with the locked mutator.
+  auto global_lock = global_critical_region_.Acquire();
+
   uint32_t dirty_mask = dirty_blocks_.exchange(0, std::memory_order_relaxed);
   uint32_t dirty_count = rex::bit_count(dirty_mask);
   if (dirty_count == 0 || dirty_count > 16) {
@@ -360,7 +370,9 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
         valid_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
       }
       if (valid_flags) {
-        valid_flags[i] |= valid_bits;
+        // [BO-RACE-FIX] active buffer is read lock-free by RequestRange(s); use
+        // atomic word ops so those reads never tear against these writes.
+        std::atomic_ref<uint64_t>(valid_flags[i]).fetch_or(valid_bits, std::memory_order_relaxed);
       }
       uint64_t old_gpu_written = system_page_flags_valid_and_gpu_written_[i];
       uint64_t new_gpu_written =
@@ -466,7 +478,8 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       uint32_t block_first = page_first >> 6;
       uint32_t block_last = page_last >> 6;
       for (uint32_t i = block_first; i <= block_last; ++i) {
-        uint64_t block_valid = valid_flags[i];
+        uint64_t block_valid =  // [BO-RACE-FIX] atomic lock-free read of active buffer
+            std::atomic_ref<uint64_t>(valid_flags[i]).load(std::memory_order_relaxed);
         if (i == block_first) {
           uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
           block_valid |= block_before;
@@ -517,7 +530,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       uint32_t block_last = page_last >> 6;
       uint32_t range_start = UINT32_MAX;
       for (uint32_t i = block_first; i <= block_last; ++i) {
-        uint64_t block_valid = valid_flags ? valid_flags[i] : 0;
+        uint64_t block_valid =  // [BO-RACE-FIX] atomic lock-free read of active buffer
+            valid_flags ? std::atomic_ref<uint64_t>(valid_flags[i]).load(std::memory_order_relaxed)
+                        : 0;
         // Consider pages in the block outside the requested range valid.
         if (i == block_first) {
           uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
@@ -632,7 +647,8 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
       invalidate_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
     }
     if (valid_flags) {
-      valid_flags[i] &= ~invalidate_bits;
+      // [BO-RACE-FIX] atomic write: paired with lock-free reads in RequestRange(s).
+      std::atomic_ref<uint64_t>(valid_flags[i]).fetch_and(~invalidate_bits, std::memory_order_relaxed);
     }
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
     dirty_blocks_mask |= uint32_t(1) << (i >> 6);
@@ -660,10 +676,12 @@ void SharedMemory::PrepareForTraceDownload() {
   auto global_lock = global_critical_region_.Acquire();
   uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
   for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
-    uint64_t previously_valid_block = valid_flags ? valid_flags[i] : 0;
+    uint64_t previously_valid_block =  // [BO-RACE-FIX] atomic lock-free read
+        valid_flags ? std::atomic_ref<uint64_t>(valid_flags[i]).load(std::memory_order_relaxed) : 0;
     uint64_t gpu_written_block = system_page_flags_valid_and_gpu_written_[i];
     if (valid_flags) {
-      valid_flags[i] = gpu_written_block;
+      // [BO-RACE-FIX] atomic write: paired with lock-free reads in RequestRange(s).
+      std::atomic_ref<uint64_t>(valid_flags[i]).store(gpu_written_block, std::memory_order_relaxed);
     }
 
     // Fire watches on the invalidated pages.
