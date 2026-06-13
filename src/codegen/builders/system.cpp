@@ -31,14 +31,19 @@ bool build_attn(BuilderContext& ctx) {
 }
 
 bool build_sync(BuilderContext& ctx) {
-  // Memory barrier, x86 has strong ordering so this is a no-op
-  (void)ctx;
+  // PPC sync = heavyweight barrier; orders all load/store pairs including
+  // store-load. x86 TSO leaves store-load reorder permitted, so we need a real
+  // fence (and a compiler barrier so clang can't reorder the lifted REX_LOAD/
+  // STORE calls across it). Upstream issue #342. [BO-RACE-FIX]
+  ctx.println("\tstd::atomic_thread_fence(std::memory_order_seq_cst);");
   return true;
 }
 
 bool build_lwsync(BuilderContext& ctx) {
-  // Lightweight memory barrier, x86 has strong ordering so this is a no-op
-  (void)ctx;
+  // PPC lwsync = lightweight barrier; orders load-load, store-store and
+  // load-store, but NOT store-load. acq_rel models that exactly. Upstream #342.
+  // [BO-RACE-FIX]
+  ctx.println("\tstd::atomic_thread_fence(std::memory_order_acq_rel);");
   return true;
 }
 
