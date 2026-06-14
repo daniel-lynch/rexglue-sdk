@@ -57,6 +57,17 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Some titles (e.g. Black Ops) leave the fp16 bloom EDRAM tiles full of NaN/Inf or huge-negative
+// garbage on some frames due to a stale/uninitialized tile read (a binary-layout/timing race). The
+// composite re-reads the bloom from shared memory, so that garbage washes the whole frame white. A
+// correct frame has those tiles == 0, so zeroing NaN/Inf/negative bloom samples in the readback
+// resolve reproduces the correct (bloom-off) result. Robustness fix; safe for clean frames (only
+// touches non-finite/negative samples, which a valid bloom never contains).
+REXCVAR_DEFINE_BOOL(bloom_sanitize, true, "GPU/Vulkan",
+                    "Zero NaN/Inf/negative fp16 bloom samples in the readback resolve (fixes a "
+                    "white-screen race in titles whose composite re-reads the bloom from RAM)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -4984,6 +4995,32 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
       std::memcpy(destination, readback.mapped_data[read_index], written_length);
+      // Sanitize garbage (NaN/Inf/negative) fp16 bloom samples so a stale/uninitialized tile can't
+      // whiten the frame (see bloom_sanitize cvar). Targets the small 64bpp k_16_16_16_16(_FLOAT)
+      // bloom pyramid resolves (a length cap keeps it off the large full-res buffers), then
+      // invalidates so the composite re-samples the cleaned data from shared memory.
+      if (REXCVAR_GET(bloom_sanitize)) {
+        reg::RB_COPY_DEST_INFO copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
+        const FormatInfo* format_info = FormatInfo::Get(uint32_t(copy_dest_info.copy_dest_format));
+        if (format_info && format_info->bits_per_pixel == 64 && written_length < (2u << 20)) {
+          bool changed = false;
+          for (uint32_t off = 0; off + 2u <= written_length; off += 2u) {
+            uint16_t h;
+            std::memcpy(&h, destination + off, 2);
+            uint16_t half = __builtin_bswap16(h);  // guest fp16 halfs are big-endian
+            // NaN/Inf: exponent all ones. Negative: sign bit set with nonzero magnitude.
+            bool bad = (half & 0x7C00u) == 0x7C00u || ((half & 0x8000u) && (half & 0x7FFFu));
+            if (bad) {
+              uint16_t zero = 0;
+              std::memcpy(destination + off, &zero, 2);
+              changed = true;
+            }
+          }
+          if (changed) {
+            shared_memory_->MemoryInvalidationCallback(written_address, written_length, true);
+          }
+        }
+      }
     }
   }
 
