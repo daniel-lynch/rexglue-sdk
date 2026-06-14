@@ -648,14 +648,25 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     }
     uint32_t rt_is_64bpp = (rts_are_64bpp >> rt_bit_index) & 1;
     // The last render target can occupy the EDRAM until the base of the first
-    // render target (itself in case of 1 render target) with EDRAM addressing
-    // wrapping.
+    // render target with EDRAM addressing wrapping - but only when there is a
+    // *different* first render target to wrap toward. With a single bound render
+    // target the wrap target would be the render target's own base, making the
+    // clamp the whole EDRAM (kEdramTileCount); combined with an over-estimated
+    // height (e.g. an unclipped depth-only prepass whose extent isn't tightened
+    // without execute_unclipped_draw_vs_on_cpu), ChangeOwnership would then wrap
+    // and steal the lower EDRAM tiles owned by another (previously bound) render
+    // target - e.g. a depth-only draw at base 1073 claiming the color region at
+    // base 98, so the scene-color resolve dumps the depth image and renders
+    // black. A lone surface cannot physically span past the EDRAM end onto tiles
+    // below its own base, so clamp it to the EDRAM end (no wrap).
+    uint32_t rt_end_clamp_tiles =
+        (i + 1 < edram_bases_sorted_count)
+            ? edram_bases_sorted[i + 1].first
+            : (edram_bases_sorted_count > 1 ? xenos::kEdramTileCount + edram_bases_sorted[0].first
+                                            : xenos::kEdramTileCount);
     rt_lengths_tiles[i] = std::min(std::min(length_used_tiles_at_32bpp << rt_is_64bpp,
                                             rt_max_distance_tiles_at_64bpp >> (rt_is_64bpp ^ 1)),
-                                   ((i + 1 < edram_bases_sorted_count)
-                                        ? edram_bases_sorted[i + 1].first
-                                        : (xenos::kEdramTileCount + edram_bases_sorted[0].first)) -
-                                       rt_base);
+                                   rt_end_clamp_tiles - rt_base);
   }
 
   if (interlock_barrier_only) {
