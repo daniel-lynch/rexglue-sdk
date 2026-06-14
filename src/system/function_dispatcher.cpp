@@ -132,21 +132,33 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
   SCOPE_profile_cpu_f("cpu");
   PROFILE_INTERRUPT_DISPATCHED();
 
-  // [PERF] EE model (see ppc/context.h): take the EE lock EXCLUSIVELY first so interrupt dispatch
-  // blocks while any guest thread is in an EE-disabled (interrupts-off) region and prevents new
-  // ones from starting until the handler returns — the same exclusion the old single process-wide
-  // lock provided, but now guest EE regions run concurrently with each other (shared). Lock order
-  // is always ee-before-kernel. The handler is guest code that will itself mtmsrd, so mark this
-  // thread "in interrupt" — nested EE toggles then only adjust the per-thread depth instead of
-  // trying to re-take the shared lock (which would self-deadlock against this exclusive hold).
+  // EE model (see ppc/context.h) + guest-spinlock lock ordering (see xeKeKfAcquireSpinLock).
+  // Two locks are in play during interrupt dispatch, and the order between them is load-bearing:
+  //   * the global (kernel) critical region ("glock") — guest spinlocks hold it for their whole
+  //     lifetime (KeAcquireSpinLock -> glock.lock()), so a guest thread holding a spinlock that
+  //     then runs an interlocked op takes locks in the order {glock -> ee_shared}.
+  //   * ppc_ee_mutex EXCLUSIVE — blocks interrupt delivery while any guest thread is in an
+  //     EE-disabled (interrupts-off) region and stops new ones starting until the handler returns;
+  //     guest EE regions otherwise run concurrently with each other (shared).
+  // We MUST acquire them in that SAME {glock -> ee} order, or we get an ABBA deadlock: the guest
+  // holds the glock (spinlock) and waits for ee_shared, while the interrupt holds ee_exclusive and
+  // waits for the glock. (Observed: MW2 froze at the title — a guest-spinlock thread vs. the GPU
+  // vblank interrupt; the exact inversion the xeKeKfAcquireSpinLock comment warns about, silently
+  // re-introduced once the EE rwlock began being taken before the glock here.) Nothing takes
+  // {ee_shared -> glock} (EE regions are tiny lwarx/stwcx ops with no kernel calls), so glock-first
+  // does not merely rotate the cycle. It is also more correct: a guest holding a spinlock has
+  // interrupts disabled on real HW, so the interrupt should wait for the spinlock to release —
+  // which is exactly what acquiring the glock first enforces.
+  auto global_lock = global_critical_region_.Acquire();
   std::unique_lock<std::shared_mutex> ee_lock(ppc_ee_mutex());
+  // Handler is guest code that will itself mtmsrd; mark this thread "in interrupt" so nested EE
+  // toggles only adjust the per-thread depth instead of re-taking the shared lock (which would
+  // self-deadlock against this exclusive hold). Declared last -> cleared first, before either lock
+  // is released.
   struct EeInterruptScope {
     EeInterruptScope() { ppc_ee_in_interrupt() = true; }
     ~EeInterruptScope() { ppc_ee_in_interrupt() = false; }
   } ee_interrupt_scope;
-
-  // Hold the global (kernel) lock during interrupt dispatch to protect kernel structures.
-  auto global_lock = global_critical_region_.Acquire();
 
   auto* ctx = thread_state->context();
   assert_true(arg_count <= 5);
