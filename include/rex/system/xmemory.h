@@ -291,6 +291,14 @@ class PhysicalHeap : public BaseHeap {
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
  protected:
+  // Per-page transition spinlock for the lock-free write-watch path. Acquire
+  // before flipping a page's notify_on_invalidation bit together with its host
+  // protection; release after. Contended only when two threads touch the same
+  // system page at once (≈never). Never held across a global_critical_region_
+  // acquire, so a glock holder may spin on it without deadlock.
+  void AcquirePageTransition(uint32_t system_page_index);
+  void ReleasePageTransition(uint32_t system_page_index);
+
   VirtualHeap* parent_heap_;
 
   uint32_t system_page_size_;
@@ -300,6 +308,12 @@ class PhysicalHeap : public BaseHeap {
     // Whether writing to each page should result trigger invalidation
     // callbacks.
     uint64_t notify_on_invalidation;
+    // Per-page transition lock used by the lock-free write-watch path
+    // (writewatch_lockfree). A set bit means a thread is mid-transition (flipping
+    // notify_on_invalidation and the host page protection together) for that page;
+    // accessed via std::atomic_ref as a tiny per-page test-and-set spinlock. Zero
+    // when the cvar is off.
+    uint64_t transitioning = 0;
   };
   // Protected by global_critical_region. Flags for each 64 system pages,
   // interleaved as blocks, so bit scan can be used to quickly extract ranges.

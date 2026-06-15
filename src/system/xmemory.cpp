@@ -10,7 +10,9 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <thread>
 #include <utility>
 
 #include <fmt/format.h>
@@ -36,6 +38,12 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
                     "Protect released memory to prevent accesses");
 
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
+
+REXCVAR_DEFINE_BOOL(writewatch_lockfree, false, "Memory",
+                    "Use the lock-free per-page write-watch transition path (no "
+                    "global_critical_region in EnableAccessCallbacks) to cut GPU re-arm glock "
+                    "contention at heavy skinned-geometry views. Experimental.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::memory {
 
@@ -1122,17 +1130,23 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
   // Set page state.
   for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
     auto& page_entry = page_table_[page_number];
+    // Build then atomic-publish the whole entry so the lock-free
+    // EnableAccessCallbacks reader (which reads current_protect without the
+    // glock) never observes a torn qword.
+    PageEntry pe;
+    pe.qword = std::atomic_ref<uint64_t>(page_entry.qword).load(std::memory_order_relaxed);
     if (allocation_type & memory::kMemoryAllocationReserve) {
-      if (!page_entry.state) {
+      if (!pe.state) {
         unreserved_page_count_--;
       }
       // Region is based on reservation.
-      page_entry.base_address = start_page_number;
-      page_entry.region_page_count = page_count;
+      pe.base_address = start_page_number;
+      pe.region_page_count = page_count;
     }
-    page_entry.allocation_protect = protect;
-    page_entry.current_protect = protect;
-    page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
+    pe.allocation_protect = protect;
+    pe.current_protect = protect;
+    pe.state = memory::kMemoryAllocationReserve | allocation_type;
+    std::atomic_ref<uint64_t>(page_entry.qword).store(pe.qword, std::memory_order_release);
   }
 
   return true;
@@ -1276,14 +1290,18 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
   // Set page state.
   for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
     auto& page_entry = page_table_[page_number];
-    if (!page_entry.state) {
+    // Atomic-publish the whole entry (see AllocFixed above).
+    PageEntry pe;
+    pe.qword = std::atomic_ref<uint64_t>(page_entry.qword).load(std::memory_order_relaxed);
+    if (!pe.state) {
       unreserved_page_count_--;
     }
-    page_entry.base_address = start_page_number;
-    page_entry.region_page_count = page_count;
-    page_entry.allocation_protect = protect;
-    page_entry.current_protect = protect;
-    page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
+    pe.base_address = start_page_number;
+    pe.region_page_count = page_count;
+    pe.allocation_protect = protect;
+    pe.current_protect = protect;
+    pe.state = memory::kMemoryAllocationReserve | allocation_type;
+    std::atomic_ref<uint64_t>(page_entry.qword).store(pe.qword, std::memory_order_release);
   }
 
   *out_address = heap_base_ + (start_page_number << page_size_shift_);
@@ -1450,7 +1468,13 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
   // Perform table change.
   for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
     auto& page_entry = page_table_[page_number];
-    page_entry.current_protect = protect;
+    // Atomic RMW of current_protect so the lock-free EnableAccessCallbacks reader
+    // never observes a torn qword (see AllocFixed).
+    std::atomic_ref<uint64_t> qword_ref(page_entry.qword);
+    PageEntry pe;
+    pe.qword = qword_ref.load(std::memory_order_relaxed);
+    pe.current_protect = protect;
+    qword_ref.store(pe.qword, std::memory_order_release);
   }
 
   return true;
@@ -1777,6 +1801,24 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   return BaseHeap::Protect(address, size, protect);
 }
 
+void PhysicalHeap::AcquirePageTransition(uint32_t system_page_index) {
+  std::atomic_ref<uint64_t> word(system_page_flags_[system_page_index >> 6].transitioning);
+  uint64_t bit = uint64_t(1) << (system_page_index & 63);
+  // Tiny per-page test-and-set spinlock. The critical section is a single mprotect
+  // + a bitmap word RMW, so spins are vanishingly rare and short.
+  for (unsigned spins = 0; (word.fetch_or(bit, std::memory_order_acquire) & bit) != 0; ++spins) {
+    if ((spins & 0x3F) == 0x3F) {
+      std::this_thread::yield();
+    }
+  }
+}
+
+void PhysicalHeap::ReleasePageTransition(uint32_t system_page_index) {
+  std::atomic_ref<uint64_t> word(system_page_flags_[system_page_index >> 6].transitioning);
+  uint64_t bit = uint64_t(1) << (system_page_index & 63);
+  word.fetch_and(~bit, std::memory_order_release);
+}
+
 void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                                          bool enable_invalidation_notifications,
                                          bool enable_data_providers) {
@@ -1815,6 +1857,71 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
                                                : rex::memory::PageAccess::kReadOnly;
   uint8_t* protect_base = membase_ + heap_base_;
   uint32_t protect_system_page_first = UINT32_MAX;
+
+  if (REXCVAR_GET(writewatch_lockfree)) {
+    // Lock-free re-arm: no global_critical_region_. Dropping the glock here removes
+    // the ~32ms/frame contention behind the guest fault storm at heavy skinned views.
+    // BATCHED (stage 2): the mprotect is coalesced over each contiguous run of pages
+    // that need arming, the same as the glock path below — this keeps the host
+    // mprotect syscall (and its process-wide TLB-shootdown IPI) count low, which the
+    // per-page stage-1 version inflated ~5x and which jittered the audio thread.
+    //
+    // Safety: each run is locked across its whole {mprotect-RO, publish notify}
+    // transition via the per-page transition spinlock for every page in the run, so
+    // a concurrent fault/invalidate (which also takes that lock) cannot interleave
+    // and recover a page to RW in the window. mprotect-RO happens BEFORE the notify
+    // bits are published, so a watched page is never observed writable. Pages that
+    // need arming have notify==0 and are guest-RW, hence not write-watched, hence
+    // no fault can fire on them between our decision and our lock acquire (only this
+    // GPU thread ever sets notify; faults only clear it). See writewatch design doc.
+    auto flush_run = [&](uint32_t run_first, uint32_t run_end) {
+      if (run_first == UINT32_MAX) {
+        return;
+      }
+      uint32_t run_last = run_end - 1;
+      for (uint32_t i = run_first; i <= run_last; ++i) {
+        AcquirePageTransition(i);
+      }
+      rex::memory::Protect(protect_base + run_first * system_page_size_,
+                           (run_last - run_first + 1) * system_page_size_, protect_access);
+      for (uint32_t i = run_first; i <= run_last; ++i) {
+        std::atomic_ref<uint64_t>(system_page_flags_[i >> 6].notify_on_invalidation)
+            .fetch_or(uint64_t(1) << (i & 63), std::memory_order_release);
+      }
+      for (uint32_t i = run_first; i <= run_last; ++i) {
+        ReleasePageTransition(i);
+      }
+    };
+    uint32_t run_first = UINT32_MAX;
+    for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
+      uint64_t page_flags_bit = uint64_t(1) << (i & 63);
+      uint32_t guest_page_number =
+          rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
+      // Atomic read of the whole page-table entry (glock-held writers publish it
+      // atomically) since we hold no global lock here.
+      PageEntry page_entry;
+      page_entry.qword = std::atomic_ref<uint64_t>(page_table_[guest_page_number].qword)
+                             .load(std::memory_order_acquire);
+      rex::memory::PageAccess current_page_access = ToPageAccess(page_entry.current_protect);
+      bool arm = enable_invalidation_notifications &&
+                 current_page_access != rex::memory::PageAccess::kNoAccess &&
+                 current_page_access != rex::memory::PageAccess::kReadOnly &&
+                 (std::atomic_ref<uint64_t>(system_page_flags_[i >> 6].notify_on_invalidation)
+                      .load(std::memory_order_acquire) &
+                  page_flags_bit) == 0;
+      if (arm) {
+        if (run_first == UINT32_MAX) {
+          run_first = i;
+        }
+      } else {
+        flush_run(run_first, i);
+        run_first = UINT32_MAX;
+      }
+    }
+    flush_run(run_first, system_page_last + 1);
+    return;
+  }
+
   auto global_lock = global_critical_region_.Acquire();
   for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
     // Check if need to enable callbacks for the page and raise its protection.
@@ -1985,6 +2092,34 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
     system_page_last = unwatch_last / system_page_size_;
     block_index_first = system_page_first >> 6;
     block_index_last = system_page_last >> 6;
+  }
+
+  if (REXCVAR_GET(writewatch_lockfree)) {
+    // Lock-free-coordinated path: still entered holding the glock (so all
+    // glock-holding callers stay mutually exclusive), but each page's
+    // {mprotect RW, clear notify} flip is done under that page's transition
+    // lock so it cannot interleave with a concurrent lock-free
+    // EnableAccessCallbacks re-arm. Per-page (no batched mprotect).
+    uint8_t* protect_base = membase_ + heap_base_;
+    for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
+      std::atomic_ref<uint64_t> notify_ref(system_page_flags_[i >> 6].notify_on_invalidation);
+      uint64_t bit = uint64_t(1) << (i & 63);
+      AcquirePageTransition(i);
+      if ((notify_ref.load(std::memory_order_relaxed) & bit) != 0) {
+        if (unprotect) {
+          uint32_t guest_page_number =
+              rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
+          if (ToPageAccess(page_table_[guest_page_number].current_protect) ==
+              rex::memory::PageAccess::kReadWrite) {
+            rex::memory::Protect(protect_base + i * system_page_size_, system_page_size_,
+                                 rex::memory::PageAccess::kReadWrite);
+          }
+        }
+        notify_ref.fetch_and(~bit, std::memory_order_relaxed);
+      }
+      ReleasePageTransition(i);
+    }
+    return true;
   }
 
   // Unprotect ranges that need unprotection.

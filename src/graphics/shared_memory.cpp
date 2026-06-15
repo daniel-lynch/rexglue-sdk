@@ -358,8 +358,16 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   uint32_t valid_block_last = valid_page_last >> 6;
 
   {
-    auto global_lock = global_critical_region_.Acquire();
-    uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
+    // [PERF] Lock-free on the GPU residency hot path. MakeRangeValid runs only on the
+    // command-processor thread (UploadRanges / RangeWrittenByGpu), so it is sequential with
+    // the frame-end snapshot (SetSystemPageBlocksValidWithGpuDataWritten) and every other
+    // GPU-thread mutator — all of which keep the global lock. The only CONCURRENT writer is
+    // the guest MemoryInvalidationCallback, which now also touches both bitmaps with atomic
+    // word ops, so every shared word here is read/modified/written atomically and never tears
+    // against it. Acquiring the process-wide global_critical_region_ singleton per uploaded
+    // chunk serialized the GPU thread behind the entire guest kernel (the contention the
+    // RequestRanges scan-lock removal merely relocated here).
+    uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_acquire);
 
     for (uint32_t i = valid_block_first; i <= valid_block_last; ++i) {
       uint64_t valid_bits = UINT64_MAX;
@@ -374,11 +382,15 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
         // atomic word ops so those reads never tear against these writes.
         std::atomic_ref<uint64_t>(valid_flags[i]).fetch_or(valid_bits, std::memory_order_relaxed);
       }
-      uint64_t old_gpu_written = system_page_flags_valid_and_gpu_written_[i];
+      // [PERF] atomic RMW (paired with MemoryInvalidationCallback's atomic fetch_and); the
+      // returned old value preserves the "only mark dirty if changed" behavior.
+      std::atomic_ref<uint64_t> gpu_written_ref(system_page_flags_valid_and_gpu_written_[i]);
+      uint64_t old_gpu_written =
+          written_by_gpu ? gpu_written_ref.fetch_or(valid_bits, std::memory_order_relaxed)
+                         : gpu_written_ref.fetch_and(~valid_bits, std::memory_order_relaxed);
       uint64_t new_gpu_written =
           written_by_gpu ? (old_gpu_written | valid_bits) : (old_gpu_written & ~valid_bits);
       if (new_gpu_written != old_gpu_written) {
-        system_page_flags_valid_and_gpu_written_[i] = new_gpu_written;
         gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
         dirty_blocks_.fetch_or(uint32_t(1) << (i >> 6), std::memory_order_relaxed);
       }
@@ -521,8 +533,22 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     upload_ranges_.emplace_back(page_start, page_count);
   };
   {
-    auto global_lock = global_critical_region_.Acquire();
-    valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
+    // [PERF] The upload-range scan reads only active_valid_flags_ and writes only the
+    // GPU-thread-private upload_ranges_, so it needs no global lock:
+    //   - valid_flags words are read atomically (paired with MemoryInvalidationCallback's
+    //     atomic fetch_and and MakeRangeValid's atomic fetch_or — see [BO-RACE-FIX]), so
+    //     concurrent guest invalidations are observed cleanly, never torn.
+    //   - the active_valid_flags_ pointer is only ever swapped by this same
+    //     command-processor thread (SetSystemPageBlocksValidWithGpuDataWritten), so it
+    //     cannot change underneath the scan.
+    //   - upload_ranges_ is private to the (single) command-processor thread that calls
+    //     RequestRanges; the validity mutation after upload still takes the lock for its
+    //     own atomic fetch_or inside MakeRangeValid.
+    // This is the identical lock-free read the all-valid early-out above already performs.
+    // Acquiring the process-wide global_critical_region_ singleton here serialized the GPU
+    // thread behind ALL guest kernel/skinning activity ("disabling interrupts in the
+    // guest") — ~770 acquisitions/frame at the crew view, ~40% of frametime.
+    valid_flags = active_valid_flags_.load(std::memory_order_acquire);
     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
       uint32_t page_first = range.first >> page_size_log2_;
       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
@@ -624,12 +650,17 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     // the CPU game code takes 3 ms to run per frame, but with 256 KB, it's
     // 0.7 ms.
     if (page_first & 63) {
-      uint64_t gpu_written_start = system_page_flags_valid_and_gpu_written_[block_first];
+      // [PERF] atomic load — paired with the lock-free atomic writes in MakeRangeValid.
+      uint64_t gpu_written_start =
+          std::atomic_ref<uint64_t>(system_page_flags_valid_and_gpu_written_[block_first])
+              .load(std::memory_order_relaxed);
       gpu_written_start &= (uint64_t(1) << (page_first & 63)) - 1;
       page_first = (page_first & ~uint32_t(63)) + (64 - rex::lzcnt(gpu_written_start));
     }
     if ((page_last & 63) != 63) {
-      uint64_t gpu_written_end = system_page_flags_valid_and_gpu_written_[block_last];
+      uint64_t gpu_written_end =
+          std::atomic_ref<uint64_t>(system_page_flags_valid_and_gpu_written_[block_last])
+              .load(std::memory_order_relaxed);
       gpu_written_end &= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
       page_last =
           (page_last & ~uint32_t(63)) + (std::max(rex::tzcnt(gpu_written_end), uint8_t(1)) - 1);
@@ -650,7 +681,9 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
       // [BO-RACE-FIX] atomic write: paired with lock-free reads in RequestRange(s).
       std::atomic_ref<uint64_t>(valid_flags[i]).fetch_and(~invalidate_bits, std::memory_order_relaxed);
     }
-    system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
+    // [PERF] atomic RMW — paired with the lock-free atomic writes in MakeRangeValid.
+    std::atomic_ref<uint64_t>(system_page_flags_valid_and_gpu_written_[i])
+        .fetch_and(~invalidate_bits, std::memory_order_relaxed);
     dirty_blocks_mask |= uint32_t(1) << (i >> 6);
   }
   gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
