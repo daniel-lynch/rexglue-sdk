@@ -13,6 +13,8 @@
  *              role as a function dispatch table rather than a CPU emulator.
  */
 
+#include <thread>  // std::this_thread::yield — interrupt-dispatch lock backoff
+
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -133,28 +135,39 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
   PROFILE_INTERRUPT_DISPATCHED();
 
   // EE model (see ppc/context.h) + guest-spinlock lock ordering (see xeKeKfAcquireSpinLock).
-  // Two locks are in play during interrupt dispatch, and the order between them is load-bearing:
-  //   * the global (kernel) critical region ("glock") — guest spinlocks hold it for their whole
-  //     lifetime (KeAcquireSpinLock -> glock.lock()), so a guest thread holding a spinlock that
-  //     then runs an interlocked op takes locks in the order {glock -> ee_shared}.
+  // Two locks are in play during interrupt dispatch:
+  //   * the global (kernel) critical region ("glock") — protects kernel structures the guest
+  //     interrupt handler touches.
   //   * ppc_ee_mutex EXCLUSIVE — blocks interrupt delivery while any guest thread is in an
   //     EE-disabled (interrupts-off) region and stops new ones starting until the handler returns;
   //     guest EE regions otherwise run concurrently with each other (shared).
-  // We MUST acquire them in that SAME {glock -> ee} order, or we get an ABBA deadlock: the guest
-  // holds the glock (spinlock) and waits for ee_shared, while the interrupt holds ee_exclusive and
-  // waits for the glock. (Observed: MW2 froze at the title — a guest-spinlock thread vs. the GPU
-  // vblank interrupt; the exact inversion the xeKeKfAcquireSpinLock comment warns about, silently
-  // re-introduced once the EE rwlock began being taken before the glock here.) Nothing takes
-  // {ee_shared -> glock} (EE regions are tiny lwarx/stwcx ops with no kernel calls), so glock-first
-  // does not merely rotate the cycle. It is also more correct: a guest holding a spinlock has
-  // interrupts disabled on real HW, so the interrupt should wait for the spinlock to release —
-  // which is exactly what acquiring the glock first enforces.
-  auto global_lock = global_critical_region_.Acquire();
-  std::unique_lock<std::shared_mutex> ee_lock(ppc_ee_mutex());
+  // There is NO globally consistent acquisition order between them, because guest code takes the
+  // pair BOTH ways:
+  //   * {glock -> ee_shared}: a guest spinlock (KeAcquireSpinLock -> glock) held across an
+  //     interlocked op (ee_shared).
+  //   * {ee_shared -> glock}: an EE-disabled guest path that then calls a glock-taking kernel
+  //     routine — the canonical Windows "raise IRQL, then take spinlock" order. (Observed on IW4
+  //     at the crew transition: a stuck ee_shared reader vs. the GPU vblank interrupt holding
+  //     glock — a hard ABBA freeze.)
+  // An earlier fix pinned this to glock-before-ee assuming {ee_shared -> glock} never happened; it
+  // does, so any fixed order merely rotates the cycle. Instead we NEVER block on one of these locks
+  // while holding the other: take glock, TRY ee_exclusive, and on contention drop glock + yield +
+  // retry. Interrupt dispatch is timing-tolerant, so the backoff is harmless and breaks both
+  // inversions (the partner thread can always make progress to release whichever lock we need).
+  auto global_lock = global_critical_region_.AcquireDeferred();
+  std::unique_lock<std::shared_mutex> ee_lock(ppc_ee_mutex(), std::defer_lock);
+  for (;;) {
+    global_lock.lock();
+    if (ee_lock.try_lock()) {
+      break;  // hold both — proceed into the handler
+    }
+    global_lock.unlock();  // an EE region is active and may be a {ee_shared -> glock} waiter
+    std::this_thread::yield();
+  }
   // Handler is guest code that will itself mtmsrd; mark this thread "in interrupt" so nested EE
   // toggles only adjust the per-thread depth instead of re-taking the shared lock (which would
   // self-deadlock against this exclusive hold). Declared last -> cleared first, before either lock
-  // is released.
+  // is released (release order stays ee-then-glock, as before).
   struct EeInterruptScope {
     EeInterruptScope() { ppc_ee_in_interrupt() = true; }
     ~EeInterruptScope() { ppc_ee_in_interrupt() = false; }
