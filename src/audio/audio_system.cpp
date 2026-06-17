@@ -28,6 +28,14 @@ REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
 
+REXCVAR_DEFINE_BOOL(
+    audio_worker_realtime, false, "Audio",
+    "Run the guest Audio Worker thread at SCHED_FIFO real-time priority so it keeps producing "
+    "frames at realtime during heavy scenes (e.g. the write-watch fault storm at skinned-geometry "
+    "views) instead of losing scheduling races to the geometry/GPU threads and underrunning the "
+    "audio queue (silence crunch). Requires the process to have RLIMIT_RTPRIO (e.g. membership in "
+    "the @audio group); no-ops with a warning otherwise. Experimental.");
+
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
 // decoders. Later games use XAudio*() and direct memory writes to the XMA
@@ -88,6 +96,18 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
 
   worker_thread_->set_name("Audio Worker");
   worker_thread_->Create();
+
+  // Optionally elevate the Audio Worker to real-time scheduling so it keeps refilling the audio
+  // queue under heavy-scene scheduling pressure (the write-watch fault storm). The host thread's
+  // set_priority is SCHED_FIFO on POSIX and no-ops with a warning if the process lacks
+  // RLIMIT_RTPRIO. Use the underlying host thread (thread()), not XThread::SetPriority which is
+  // the guest-scheduler priority increment.
+  if (REXCVAR_GET(audio_worker_realtime)) {
+    if (auto* host_thread = worker_thread_->thread()) {
+      host_thread->set_priority(rex::thread::ThreadPriority::kHighest);
+      REXAPU_INFO("Audio Worker requested SCHED_FIFO real-time priority (audio_worker_realtime).");
+    }
+  }
 
   return X_STATUS_SUCCESS;
 }
