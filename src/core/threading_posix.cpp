@@ -31,7 +31,10 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <unistd.h>
 
 #include <rex/assert.h>
+#include <condition_variable>
+
 #include <rex/chrono/chrono_steady_cast.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/thread/timer_queue.h>
 
@@ -58,6 +61,39 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #endif
 
 namespace rex::thread {
+
+// POSIX has no native wait-for-multiple-objects, so PosixConditionBase::WaitMultiple polls (it
+// trylocks each handle, checks signaled(), then sleeps). This was a fixed 1ms poll, which adds up
+// to ~1ms wakeup latency + jitter to every multi-object wait — notably the guest audio render
+// thread's KeWaitForMultipleObjects, slowing audio frame production (root-caused via perf).
+//
+// wait_multiple_poll_us: tune the poll interval. wait_multiple_notify: make the wait
+// notification-driven (handle signals wake a shared CV; the poll interval becomes a correctness
+// backstop) so multi-waiters wake immediately on a signal. The CV is taken only for the wait (never
+// nested under a handle's mutex), and signalers notify after setting state, so there is no lock
+// cycle; a missed notify is bounded by the backstop.
+REXCVAR_DEFINE_UINT32(wait_multiple_poll_us, 1000, "Threading",
+                      "Poll/backstop interval (microseconds) for the wait-for-multiple-objects "
+                      "fallback. Lower = faster wakeup at the cost of more poll CPU.");
+REXCVAR_DEFINE_BOOL(wait_multiple_notify, false, "Threading",
+                    "Make WaitMultiple notification-driven (handle signals wake waiters via a "
+                    "shared condition variable; wait_multiple_poll_us is the backstop) instead of "
+                    "pure polling. Cuts multi-object wait latency + poll CPU. Experimental.");
+
+static std::condition_variable g_multi_wait_cv;
+static std::mutex g_multi_wait_mutex;
+static std::atomic<bool> g_multi_wait_notify_enabled{false};
+
+// Called from handle signal paths to wake any notification-driven multi-waiter. Gated by an atomic
+// so the common (disabled) case costs only a relaxed load. Takes g_multi_wait_mutex only briefly
+// and never while the caller needs a handle mutex the waiter could hold -> no lock-order cycle.
+static inline void NotifyMultiWaiters() {
+  if (!g_multi_wait_notify_enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  { std::lock_guard<std::mutex> lk(g_multi_wait_mutex); }
+  g_multi_wait_cv.notify_all();
+}
 
 #if REX_PLATFORM_ANDROID
 // May be null if no dynamically loaded functions are required.
@@ -276,6 +312,19 @@ class PosixConditionBase {
       return std::make_pair(result, 0);
     }
 
+    // tunable poll interval + optional notification-driven wakeup (was a fixed 1ms
+    // poll). Read once per call (not per poll iteration). When notify is on, the poll interval is a
+    // correctness backstop for the (rare) signal-between-check-and-wait window.
+    uint32_t poll_us = REXCVAR_GET(wait_multiple_poll_us);
+    if (poll_us == 0) {
+      poll_us = 1;
+    }
+    const auto poll_interval = std::chrono::microseconds(poll_us);
+    const bool use_notify = REXCVAR_GET(wait_multiple_notify);
+    if (use_notify) {
+      g_multi_wait_notify_enabled.store(true, std::memory_order_relaxed);
+    }
+
     auto start_time = std::chrono::steady_clock::now();
     auto end_time = (timeout == std::chrono::milliseconds::max())
                         ? std::chrono::steady_clock::time_point::max()
@@ -357,12 +406,18 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
-      if (timeout == std::chrono::milliseconds::max()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      // Wait until either a handle signals (notify path) or the poll/backstop interval elapses.
+      auto wait_dur = poll_interval;
+      if (timeout != std::chrono::milliseconds::max()) {
+        wait_dur = std::min(
+            poll_interval,
+            std::chrono::duration_cast<std::chrono::microseconds>(end_time - now));
+      }
+      if (use_notify) {
+        std::unique_lock<std::mutex> notify_lk(g_multi_wait_mutex);
+        g_multi_wait_cv.wait_for(notify_lk, wait_dur);
       } else {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-        std::this_thread::sleep_for(sleep_time);
+        std::this_thread::sleep_for(wait_dur);
       }
     }
   }
@@ -396,6 +451,7 @@ class PosixCondition<Event> : public PosixConditionBase {
     auto lock = std::unique_lock<std::mutex>(mutex_);
     signal_ = true;
     cond_.notify_all();
+    NotifyMultiWaiters();  // wake notification-driven multi-waiters
     return true;
   }
 
@@ -433,6 +489,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
     }
     count_ += release_count;
     cond_.notify_all();
+    NotifyMultiWaiters();  // wake notification-driven multi-waiters
     return true;
   }
 
@@ -465,6 +522,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
       // Free to be acquired by another thread
       if (count_ == 0) {
         cond_.notify_all();
+        NotifyMultiWaiters();  // wake notification-driven multi-waiters
       }
       return true;
     }
@@ -497,6 +555,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
     std::lock_guard<std::mutex> lock(mutex_);
     signal_ = true;
     cond_.notify_all();
+    NotifyMultiWaiters();  // wake notification-driven multi-waiters
     return true;
   }
 
@@ -884,6 +943,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       exit_code_ = exit_code;
       signaled_ = true;
       cond_.notify_all();
+      NotifyMultiWaiters();  // wake notification-driven multi-waiters
     }
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
