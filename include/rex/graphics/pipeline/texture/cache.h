@@ -380,6 +380,12 @@ class TextureCache {
 
     uint32_t host_pitch;
     uint32_t height_texels;
+
+    // MW2 lightmap fix: per-texel RGB multiplier applied by the 32bpb load shader
+    // (push-const member 8). 1.0 = identity (the original byte-identical copy path);
+    // > 1.0 unpacks BGRA/RGBA, scales RGB (alpha preserved), repacks. Set only for
+    // lightmap-signature textures; see lightmap_scale cvar in texture_cache.cpp.
+    float rgb_scale;
   };
 
   static constexpr uint32_t kLoadGuestXThreadsPerGroupLog2 = 2;

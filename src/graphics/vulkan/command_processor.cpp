@@ -22,6 +22,9 @@
 #include <vector>
 
 #include <cstdio>          // [BO-SHOT] one-shot frontbuffer dump
+#include <atomic>
+#include <cmath>
+#include <filesystem>      // live-tune control-file mtime poll
 #include <rex/platform.h>  // REX_PLATFORM_WIN32 guards the POSIX-only SIGUSR1 fbdump trigger
 #if !REX_PLATFORM_WIN32
 #include <csignal>
@@ -70,6 +73,70 @@ REXCVAR_DEFINE_BOOL(bloom_sanitize, true, "GPU/Vulkan",
 
 REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// IW4 (Modern Warfare 2 etc.) renders world lighting in gamma-space HDR: a global ~8.4x light-scale
+// is applied to direct/sun light but DROPPED on the indirect "lightprobe ambient" term. The engine
+// binds the unscaled ambient probe in one pixel float-const and its properly-scaled twin (= ambient
+// * ~8.4) in the immediately-following const, but the lit shaders read the UNSCALED one, so
+// ambient- lit / shadowed surfaces render ~5x too dark. Scaling only the fingerprinted ambient
+// const (the {ambient, ambient*[7.5..9.5]} adjacent pair, each component a plausible ambient color)
+// restores reference brightness with hue preserved and no bleed into non-ambient terms. Keyed on
+// the numeric pattern, not a guest address, so it is binary-agnostic (SP + MP). Default 1.0 = off
+// (no-op for titles that don't need it); ~5.0 matches the IW4 reference (the full ~8.4 twin
+// overshoots/clips).
+REXCVAR_DEFINE_DOUBLE(lightprobe_ambient_scale, 1.0, "GPU/Vulkan",
+                      "Scale the IW4 world/indirect lightprobe-ambient pixel constant to correct "
+                      "~5x-too-dark ambient lighting (1.0 = off; ~5.0 matches reference)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// IW4 atmospheric-fog HDR-scale fix (Bug #4 of the dark-scene issue): the in-world lit pixel
+// shaders fog via lerp(litColor, fogColor, fogOpacity) where the effective fog color is itself
+// lerp(baseFog, sunFog, sunFactor). RenderDoc on the Pit confirmed the engine uploads the SAME
+// base fog color into TWO PS float-const slots per lit world shader (the baseFog + sunFog-base
+// registers — e.g. reg0==reg10, reg0==reg13, or reg0==reg2; value (0.31,0.23,0.22) here, a dim
+// warm haze identical across all 63 lit world materials). That duplicated dim-color structure is
+// a robust, binary/map-agnostic fingerprint (the register index varies per shader, the value +
+// duplication do not). On real hardware the haze is a bright dusty wash that lifts shadows and
+// brightens the sky; ours is dim because the fog color dropped the same ~5-8x HDR light-scale the
+// rest of the indirect lighting did, so the scene reads contrasty/over-saturated with a dark sky.
+// This cvar scales every PS float const whose rgb is a non-degenerate dim color (w~=1) that
+// appears at >=2 used slots in the current shader, at upload — same self-gated mechanism as
+// lightprobe_ambient_scale, never touching HUD/material/2D consts. 1.0 = off. Hot-reloadable.
+REXCVAR_DEFINE_DOUBLE(fog_color_scale, 1.0, "GPU/Vulkan",
+                      "Scale the IW4 HDR atmospheric fog color (base + sun-fog) PS constants to "
+                      "restore the haze that brightens the sky and lifts shadows (1.0 = off)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// ---- Live-tuning harness (dark-scene work)
+// ------------------------------------------------------- When `live_tune_file` is a non-empty
+// path, IssueSwap polls that file once per frame and, on mtime change, re-applies it via
+// cvar::LoadConfig (so every kHotReload cvar updates live without a relaunch or the F4 overlay). If
+// a BAKED texture-scale cvar (lightmap_scale / model_lighting_scale, whose scale is folded into the
+// texture at decode time) changed, it also drains the GPU and clears the texture cache so
+// lightmaps/volumes re-decode at the new value — fixing the "scale does nothing live" problem. Each
+// apply logs a [MW2-TUNE] line with all knob values (the "all the data" dump). Empty default = zero
+// overhead in normal runs. Write e.g. `lightmap_scale = 8.0` to the file to tune.
+REXCVAR_DEFINE_STRING(live_tune_file, "", "GPU/Vulkan",
+                      "Path to a live cvar control file polled each frame; on change its toml is "
+                      "applied to hot-reload cvars (empty = off)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Global display grade applied in the swap apply-gamma pass (post-scene, pre-swapchain). These are
+// a TUNING tool for matching a reference look — exposure/saturation/per-channel tint. They operate
+// on the final LDR image so they CANNOT recover already-crushed blacks (use the lighting scales for
+// that); they are for overall tone/color. All default to identity (no-op).
+REXCVAR_DEFINE_DOUBLE(scene_exposure, 1.0, "GPU/Vulkan",
+                      "Display-grade exposure multiply in the swap gamma pass (1.0 = off)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(scene_saturation, 1.0, "GPU/Vulkan",
+                      "Display-grade saturation in the swap gamma pass (1.0 = off, 0 = grayscale)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(scene_tint_r, 1.0, "GPU/Vulkan", "Display-grade red tint (1.0 = off)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(scene_tint_g, 1.0, "GPU/Vulkan", "Display-grade green tint (1.0 = off)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(scene_tint_b, 1.0, "GPU/Vulkan", "Display-grade blue tint (1.0 = off)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
@@ -2325,11 +2392,61 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+void VulkanCommandProcessor::MaybeApplyLiveTune() {
+  // See the live_tune_file cvar comment near the top of this file. Cheap: one cvar read + (when
+  // armed) one stat() per frame. Only re-applies on mtime change.
+  const std::string& tune_file = REXCVAR_GET(live_tune_file);
+  if (tune_file.empty()) {
+    return;
+  }
+  std::error_code ec;
+  auto mtime = std::filesystem::last_write_time(tune_file, ec);
+  if (ec) {
+    return;  // file missing/unreadable — silently skip until it appears
+  }
+  static std::filesystem::file_time_type s_last_mtime{};
+  static bool s_initialized = false;
+  if (s_initialized && mtime == s_last_mtime) {
+    return;
+  }
+  const bool first_apply = !s_initialized;
+  s_last_mtime = mtime;
+  s_initialized = true;
+
+  const double old_lightmap = rex::cvar::Query<double>("lightmap_scale");
+  const double old_model = rex::cvar::Query<double>("model_lighting_scale");
+  rex::cvar::LoadConfig(tune_file);
+  const double new_lightmap = rex::cvar::Query<double>("lightmap_scale");
+  const double new_model = rex::cvar::Query<double>("model_lighting_scale");
+
+  // The texture-scale cvars are baked into textures at decode time, so resident lightmaps/volumes
+  // keep the old scale until evicted. On a change, drain the GPU and clear the cache to force a
+  // re-decode. Skip on the very first apply (nothing resident yet that needs rescaling).
+  if (!first_apply && texture_cache_ && (new_lightmap != old_lightmap || new_model != old_model)) {
+    AwaitAllQueueOperationsCompletion();
+    texture_cache_->ClearCache();
+    REXGPU_WARN("[MW2-TUNE] texture cache cleared (lightmap {}->{}, model {}->{})", old_lightmap,
+                new_lightmap, old_model, new_model);
+  }
+
+  // Data dump — current value of every tuning knob.
+  REXGPU_WARN(
+      "[MW2-TUNE] applied '{}' | ambient={} fog={} lightmap={} model={} | exposure={} sat={} "
+      "tint=({},{},{})",
+      tune_file, rex::cvar::Query<double>("lightprobe_ambient_scale"),
+      rex::cvar::Query<double>("fog_color_scale"), new_lightmap, new_model,
+      rex::cvar::Query<double>("scene_exposure"), rex::cvar::Query<double>("scene_saturation"),
+      rex::cvar::Query<double>("scene_tint_r"), rex::cvar::Query<double>("scene_tint_g"),
+      rex::cvar::Query<double>("scene_tint_b"));
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
+
+  MaybeApplyLiveTune();
 
   if (!graphics_system_)
     return;
@@ -6873,6 +6990,67 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         return false;
       }
       buffer_info.range = VkDeviceSize(float_constants_size);
+      // IW4 world-ambient HDR-scale fix — see the lightprobe_ambient_scale cvar (defined at top of
+      // file) for the full rationale. Scale only the fingerprinted ambient const (the {ambient,
+      // ambient*~8.4} adjacent pair) so hue is preserved and non-ambient terms are untouched. 1.0 =
+      // off (default).
+      const float kDarkfixScale = float(REXCVAR_GET(lightprobe_ambient_scale));
+      const bool apply_ambient_scale =
+          kDarkfixScale > 0.0f && std::fabs(kDarkfixScale - 1.0f) > 1e-4f;
+      // IW4 fog-color HDR fix (Bug #4) — see the fog_color_scale cvar above. Precompute the set of
+      // PS float consts to scale: a const is fog iff its rgb is a non-degenerate dim color (w~=1,
+      // each channel in [0.02,2.0], not near-white, not near-equal-gray) AND the same rgb appears
+      // at another used slot in this shader (the baseFog/sunFog-base duplication observed in
+      // RenderDoc).
+      const float kFogScale = float(REXCVAR_GET(fog_color_scale));
+      const bool apply_fog_scale = kFogScale > 0.0f && std::fabs(kFogScale - 1.0f) > 1e-4f;
+      std::array<bool, 256> fog_scale_mask{};
+      if (apply_fog_scale) {
+        // Gather used (cidx, rgb, w) for fog-candidate colors.
+        uint32_t cand_cidx[256];
+        float cand_rgb[256][3];
+        uint32_t cand_n = 0;
+        for (uint32_t i = 0; i < 4; ++i) {
+          uint64_t m = current_float_constant_map_pixel_[i];
+          uint32_t fi;
+          while (rex::bit_scan_forward(m, &fi)) {
+            m &= ~(1ull << fi);
+            const uint32_t cidx = (i << 6) + fi;
+            float c[4];
+            for (int k = 0; k < 4; ++k) {
+              uint32_t u = regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (cidx << 2) + k];
+              std::memcpy(&c[k], &u, 4);
+            }
+            const bool dim = c[0] > 0.02f && c[0] < 2.0f && c[1] > 0.02f && c[1] < 2.0f &&
+                             c[2] > 0.02f && c[2] < 2.0f;
+            const bool wish = c[3] > 0.5f && c[3] < 1.5f;
+            const bool white = c[0] > 0.9f && c[1] > 0.9f && c[2] > 0.9f;
+            const float mx = std::max(c[0], std::max(c[1], c[2]));
+            const float mn = std::min(c[0], std::min(c[1], c[2]));
+            const bool gray = (mx - mn) < 0.02f;  // skip neutral gray duplicates (e.g. (1,1,1))
+            if (dim && wish && !white && !gray) {
+              cand_cidx[cand_n] = cidx;
+              cand_rgb[cand_n][0] = c[0];
+              cand_rgb[cand_n][1] = c[1];
+              cand_rgb[cand_n][2] = c[2];
+              ++cand_n;
+            }
+          }
+        }
+        // Mark any candidate whose rgb matches another candidate's rgb (the fog duplication).
+        for (uint32_t a = 0; a < cand_n; ++a) {
+          for (uint32_t b = 0; b < cand_n; ++b) {
+            if (a == b)
+              continue;
+            if (std::fabs(cand_rgb[a][0] - cand_rgb[b][0]) < 1e-3f &&
+                std::fabs(cand_rgb[a][1] - cand_rgb[b][1]) < 1e-3f &&
+                std::fabs(cand_rgb[a][2] - cand_rgb[b][2]) < 1e-3f) {
+              fog_scale_mask[cand_cidx[a]] = true;
+              break;
+            }
+          }
+        }
+      }
       for (uint32_t i = 0; i < 4; ++i) {
         uint64_t float_constant_map_entry = current_float_constant_map_pixel_[i];
         uint32_t float_constant_index;
@@ -6882,6 +7060,47 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
               mapping,
               &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
               sizeof(float) * 4);
+          // Generalized ambient fingerprint: this const (vec4 index cidx in the 256-entry PS file)
+          // is the unscaled ambient iff the NEXT const ~= this * [7.5..9.5] with the ratio
+          // consistent across xyz and this is a plausible ambient color (each comp in [0.1,5]).
+          // Scale only this const → hue kept.
+          const uint32_t cidx =
+              (i << 6) + float_constant_index;  // 0..255 within the PS float-const file
+          if (apply_ambient_scale && cidx < 255u) {
+            float amb[3], twin[3];
+            for (int k = 0; k < 3; ++k) {
+              uint32_t u = regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (cidx << 2) + k];
+              std::memcpy(&amb[k], &u, 4);
+              u = regs[XE_GPU_REG_SHADER_CONSTANT_256_X + ((cidx + 1u) << 2) + k];
+              std::memcpy(&twin[k], &u, 4);
+            }
+            bool fp = amb[0] > 0.1f && amb[0] < 5.0f && amb[1] > 0.1f && amb[1] < 5.0f &&
+                      amb[2] > 0.1f && amb[2] < 5.0f;
+            const float r0 = fp ? twin[0] / amb[0] : 0.0f;
+            if (fp)
+              fp = r0 > 7.5f && r0 < 9.5f;
+            if (fp) {
+              for (int k = 1; k < 3; ++k) {
+                if (std::fabs((twin[k] / amb[k]) - r0) > 0.8f)
+                  fp = false;
+              }
+            }
+            if (fp) {
+              float* dst = reinterpret_cast<float*>(mapping);
+              dst[0] = amb[0] * kDarkfixScale;
+              dst[1] = amb[1] * kDarkfixScale;
+              dst[2] = amb[2] * kDarkfixScale;
+            }
+          }
+          // IW4 fog-color HDR fix: scale the rgb of consts the precompute fingerprinted as fog
+          // (the duplicated baseFog/sunFog-base color), preserving hue + w. Self-gated, so HUD /
+          // material / 2D consts are untouched.
+          if (apply_fog_scale && fog_scale_mask[cidx]) {
+            float* dst = reinterpret_cast<float*>(mapping);
+            dst[0] *= kFogScale;
+            dst[1] *= kFogScale;
+            dst[2] *= kFogScale;
+          }
           mapping += sizeof(float) * 4;
         }
       }

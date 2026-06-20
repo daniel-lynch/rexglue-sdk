@@ -35,6 +35,31 @@
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
 
+// MW2 lightmap fix (Bug #2 of the IW4 dark-scene issue): IW4 bakes world/prop indirect
+// lighting into a lightmap texture whose content is ~4x too dark relative to the HDR
+// reference (the same ~5-8x HDR-scale drop as the world-ambient const fixed by
+// lightprobe_ambient_scale, one level down). Textures load via a precompiled GPU compute
+// shader (no CPU lever), so the boost is a per-texel RGB scale baked into the 32bpb load
+// shader, gated by LoadConstants::rgb_scale. This cvar drives that scale for
+// lightmap-signature textures only (uncompressed k_8_8_8_8 2D, see LoadTextureData...Impl).
+// 1.0 = off (byte-identical original copy path). Hot-reloadable for live tuning.
+REXCVAR_DEFINE_DOUBLE(lightmap_scale, 1.0, "GPU/Vulkan",
+                      "Scale RGB of IW4 lightmap textures to correct ~4x-too-dark baked "
+                      "indirect lighting (1.0 = off; tune ~2-4 to match reference)");
+
+// MW2 dynamic-model lighting fix (Bug #3 of the dark-scene issue): dynamic models
+// (the first-person weapon viewmodel + characters/enemies/civilians) are lit by the IW4
+// "lightprobe" (lp_*) shader family, whose indirect ambient floor is `lightprobe_diffuse.xyz*2`
+// sampled from the `modelLighting` 3D volume texture (code-texture slot 0x3) — NOT the
+// world-ambient pixel const c274 (Bug #1) nor the lightmap texture (Bug #2). That volume's
+// content carries the same ~5-8x-too-low indirect magnitude, so the gun/characters render
+// black. The volume is a resident guest texture loaded through the same path as the lightmap,
+// and the rgb_scale load-shader path (Bug #2) is dimension-agnostic, so this cvar scales its
+// RGB via a parallel 3D-volume gate in LoadTextureDataFromResidentMemoryImpl. 1.0 = off.
+REXCVAR_DEFINE_DOUBLE(model_lighting_scale, 1.0, "GPU/Vulkan",
+                      "Scale RGB of the IW4 modelLighting 3D volume to correct too-dark "
+                      "dynamic-model (viewmodel/character) indirect lighting (1.0 = off)");
+
 namespace rex::graphics::vulkan {
 
 // Generated with `xb buildshaders`.
@@ -1513,6 +1538,35 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   VkDescriptorSet descriptor_set_source_current = VK_NULL_HANDLE;
 
   LoadConstants load_constants;
+  // MW2 lightmap fix: boost RGB for lightmap-signature textures (uncompressed
+  // k_8_8_8_8, 2D, >=128px atlas). 1.0 = no-op (the 32bpb load shader keeps its
+  // byte-identical copy path); driven by the lightmap_scale cvar. The gamma sign that
+  // truly marks a lightmap lives in the sampler fetch constant, not the cache key, so
+  // this signature also matches large gamma UI textures — narrow it (or thread the
+  // gamma sign down from the bind path) if the HUD brightens.
+  load_constants.rgb_scale = 1.0f;
+  {
+    const double lm = REXCVAR_GET(lightmap_scale);
+    const double ml = REXCVAR_GET(model_lighting_scale);
+    const bool sig_8888_2d = guest_format == xenos::TextureFormat::k_8_8_8_8 &&
+                             dimension == xenos::DataDimension::k2DOrStacked;
+    const auto is_pow2 = [](uint32_t v) { return v != 0 && (v & (v - 1)) == 0; };
+    // Bug #2: world lightmap (2D atlas). Signature pinned empirically (RenderDoc + per-texture
+    // load logging): the lightmap is single-mip (mips==0) and power-of-2. Requiring both excludes
+    // the mipmapped normal/spec maps (which scaling turns into specular sparkles) and the
+    // non-power-of-2 full-screen dynamic buffers 1280x720 / 1024x600 / 256x150 (which scaling blows
+    // out).
+    if (lm != 1.0 && sig_8888_2d && texture_key.mip_max_level == 0 && is_pow2(width) &&
+        is_pow2(height) && width >= 128 && height >= 128) {
+      load_constants.rgb_scale = float(lm);
+    }
+    // Bug #3: dynamic-model lighting — the modelLighting 3D volume. RenderDoc shows
+    // it is k_8_8_8_8 (fmt=6) at 512x256x4: a wide, thin volume, so gate on the small DEPTH
+    // (an actual 3D texture, not a 2D-as-3D wrapper), not width/height.
+    if (ml != 1.0 && guest_format == xenos::TextureFormat::k_8_8_8_8 && is_3d && depth <= 16) {
+      load_constants.rgb_scale = float(ml);
+    }
+  }
   // 3 bits for each.
   assert_true(texture_resolution_scale_x <= 7);
   assert_true(texture_resolution_scale_y <= 7);
@@ -1641,6 +1695,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                            0, nullptr);
 
     LoadConstants load_constants_float_convert;
+    load_constants_float_convert.rgb_scale = 1.0f;
     // Linear source and destination in the same scratch buffer, 1x1 scaling.
     load_constants_float_convert.is_tiled_3d_endian_scale =
         (uint32_t(is_3d) << 1) | (UINT32_C(1) << 4) | (UINT32_C(1) << 7);
