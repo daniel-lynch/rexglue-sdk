@@ -119,6 +119,17 @@ REXCVAR_DEFINE_DOUBLE(bloom_intensity_scale, 1.0, "GPU/Vulkan",
                       "halos (1.0 = off, <1 = less glow)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// IW4 atmospheric fog DENSITY. The lit-world fog factor is clamp(exp2(fogCoord),0,1) where the VS
+// builds fogCoord = log2(e) * (-density*distance). The log2(e) = 1.442695 conversion constant is a
+// VS float const (e.g. const[16].z) and is the ONLY exp2-fog term in the vertex path, so it is a
+// unique, binary/map-agnostic fingerprint. Scaling it multiplies the fog exponent => denser haze
+// that veils distance and brightens toward the fog color (matches the real-hardware reference look,
+// where fog_color_scale alone is too marginal). 1.0 = off, >1 = heavier haze. Hot-reloadable.
+REXCVAR_DEFINE_DOUBLE(fog_density_scale, 1.0, "GPU/Vulkan",
+                      "Scale the IW4 fog density (the log2(e) fog-coord VS constant) for heavier "
+                      "atmospheric haze (1.0 = off, >1 = denser fog)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // ---- Live-tuning harness (dark-scene work)
 // ------------------------------------------------------- When `live_tune_file` is a non-empty
 // path, IssueSwap polls that file once per frame and, on mtime change, re-applies it via
@@ -2561,10 +2572,10 @@ void VulkanCommandProcessor::MaybeApplyLiveTune() {
 
   // Data dump — current value of every tuning knob.
   REXGPU_WARN(
-      "[MW2-TUNE] applied '{}' | ambient={} fog={} bloom={} lightmap={} model={} | exposure={} "
-      "gamma={} tonemap_white={} sat={} tint=({},{},{})",
+      "[MW2-TUNE] applied '{}' | ambient={} fog={} fogdensity={} bloom={} lightmap={} model={} | "
+      "exposure={} gamma={} tonemap_white={} sat={} tint=({},{},{})",
       tune_file, rex::cvar::Query<double>("lightprobe_ambient_scale"),
-      rex::cvar::Query<double>("fog_color_scale"),
+      rex::cvar::Query<double>("fog_color_scale"), rex::cvar::Query<double>("fog_density_scale"),
       rex::cvar::Query<double>("bloom_intensity_scale"), new_lightmap, new_model,
       rex::cvar::Query<double>("scene_exposure"), rex::cvar::Query<double>("scene_gamma"),
       rex::cvar::Query<double>("scene_tonemap_white"), rex::cvar::Query<double>("scene_saturation"),
@@ -7121,6 +7132,12 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         return false;
       }
       buffer_info.range = VkDeviceSize(float_constants_size);
+      // IW4 fog-density fix — see fog_density_scale above. Scale any VS float-const component equal
+      // to log2(e) (1.442695, the exp2 fog-coord conversion) by the cvar => denser atmospheric
+      // haze.
+      const float kFogDensityScale = float(REXCVAR_GET(fog_density_scale));
+      const bool apply_fog_density =
+          kFogDensityScale > 0.0f && std::fabs(kFogDensityScale - 1.0f) > 1e-4f;
       for (uint32_t i = 0; i < 4; ++i) {
         uint64_t float_constant_map_entry = current_float_constant_map_vertex_[i];
         uint32_t float_constant_index;
@@ -7130,6 +7147,14 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
               mapping,
               &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
               sizeof(float) * 4);
+          if (apply_fog_density) {
+            float* dst = reinterpret_cast<float*>(mapping);
+            for (int k = 0; k < 4; ++k) {
+              if (std::fabs(dst[k] - 1.442695f) < 0.01f) {
+                dst[k] *= kFogDensityScale;
+              }
+            }
+          }
           mapping += sizeof(float) * 4;
         }
       }
