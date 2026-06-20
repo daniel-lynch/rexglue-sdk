@@ -108,6 +108,17 @@ REXCVAR_DEFINE_DOUBLE(fog_color_scale, 1.0, "GPU/Vulkan",
                       "restore the haze that brightens the sky and lifts shadows (1.0 = off)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// IW4 glow/bloom intensity. The glow composite shader (RenderDoc ps=1400) holds
+// r_glowBloomIntensity as a PS float const with rgb all-equal (~1.5) and a small desat in w (~0.2),
+// alongside a distinctive cutoff const with rgb all-equal NEGATIVE (~-0.05, w~4). That
+// co-occurrence uniquely fingerprints the glow composite (binary/map-agnostic, SP+MP). Scaling the
+// intensity const down shrinks the bloom halos our scene over-produces because its hot highlights
+// clip to white. 1.0 = off, hot-reloadable.
+REXCVAR_DEFINE_DOUBLE(bloom_intensity_scale, 1.0, "GPU/Vulkan",
+                      "Scale the IW4 glow/bloom intensity PS constant to reduce blown-highlight "
+                      "halos (1.0 = off, <1 = less glow)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // ---- Live-tuning harness (dark-scene work)
 // ------------------------------------------------------- When `live_tune_file` is a non-empty
 // path, IssueSwap polls that file once per frame and, on mtime change, re-applies it via
@@ -138,6 +149,125 @@ REXCVAR_DEFINE_DOUBLE(scene_tint_g, 1.0, "GPU/Vulkan", "Display-grade green tint
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(scene_tint_b, 1.0, "GPU/Vulkan", "Display-grade blue tint (1.0 = off)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(scene_gamma, 1.0, "GPU/Vulkan",
+                      "Display-grade gamma/contrast exponent applied after exposure+tint in the "
+                      "swap gamma pass (1.0 = off; >1 darkens mids/more contrast, <1 lifts)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(scene_tonemap_white, 0.0, "GPU/Vulkan",
+                      "Display-grade extended-Reinhard tonemap white point, applied after "
+                      "exposure+tint and before gamma (0 = off). Lets exposure lift dark midtones "
+                      "while highlights roll off to <=1 at this value instead of clipping")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace {
+
+// The display grade is baked into the swap apply-gamma RAMP (the per-frame 256-entry table or PWL
+// LUT every apply-gamma variant reads), so it covers ALL present paths without per-shader SPIR-V
+// surgery. A ramp is a per-channel 1D transfer function, so it carries exposure (global scale),
+// per-channel tint, and gamma (per-channel pow) exactly. SATURATION is cross-channel and CANNOT be
+// expressed in a per-channel ramp — scene_saturation needs the apply-gamma shader and is not wired
+// here (a one-time warning fires if it is set non-identity).
+struct DisplayGrade {
+  float exposure = 1.0f;
+  float tint[3] = {1.0f, 1.0f, 1.0f};
+  float gamma = 1.0f;
+  float tonemap_white = 0.0f;  // extended-Reinhard white point; 0 = off
+  bool active() const {
+    return exposure != 1.0f || gamma != 1.0f || tonemap_white != 0.0f || tint[0] != 1.0f ||
+           tint[1] != 1.0f || tint[2] != 1.0f;
+  }
+  bool operator==(const DisplayGrade& o) const {
+    return exposure == o.exposure && gamma == o.gamma && tonemap_white == o.tonemap_white &&
+           tint[0] == o.tint[0] && tint[1] == o.tint[1] && tint[2] == o.tint[2];
+  }
+};
+
+DisplayGrade QueryDisplayGrade() {
+  DisplayGrade g;
+  g.exposure = float(REXCVAR_GET(scene_exposure));
+  g.tint[0] = float(REXCVAR_GET(scene_tint_r));
+  g.tint[1] = float(REXCVAR_GET(scene_tint_g));
+  g.tint[2] = float(REXCVAR_GET(scene_tint_b));
+  g.gamma = float(REXCVAR_GET(scene_gamma));
+  g.tonemap_white = float(REXCVAR_GET(scene_tonemap_white));
+  return g;
+}
+
+// Grade one channel's [0,1] output value: exposure*tint scale, optional Reinhard highlight
+// roll-off, clamp, then gamma exponent. The tonemap lets exposure lift dark midtones (pushing
+// brights past 1) while the extended-Reinhard shoulder maps the white point W back to exactly 1.0
+// (no hard clip): T(x) = x*(1 + x/W^2)/(1 + x), which is ~identity for x<<W,1 and rolls off above.
+inline float GradeChannel(const DisplayGrade& g, float v, int channel) {
+  v *= g.exposure * g.tint[channel];
+  if (v < 0.0f) {
+    v = 0.0f;
+  }
+  if (g.tonemap_white > 0.0f) {
+    const float w = g.tonemap_white;
+    v = v * (1.0f + v / (w * w)) / (1.0f + v);
+  }
+  if (v > 1.0f) {
+    v = 1.0f;
+  }
+  if (g.gamma != 1.0f) {
+    v = std::pow(v, g.gamma);
+  }
+  return v;
+}
+
+// Post-process the freshly-uploaded gamma ramp in place, baking the display grade into its output
+// values. Little-endian host only (the big-endian PWL path byte-swaps base/delta on upload). The
+// 256-entry table is DC_LUT_30_COLOR (10-bit per channel); the PWL LUT is 128 base/delta endpoints
+// per channel interleaved as [endpoint*3 + channel], reconstructed by the shader as
+// value = (base + low3*delta*0.125) / 65472. Grading the PWL = grade each endpoint's output and
+// recompute each segment's delta as the slope to the next graded endpoint (the curve is monotonic).
+void ApplyDisplayGradeToRamp(void* ramp_upload, bool use_pwl, const DisplayGrade& g) {
+  if (!g.active()) {
+    return;
+  }
+  if (use_pwl) {
+    auto* pwl = reinterpret_cast<rex::graphics::reg::DC_LUT_PWL_DATA*>(ramp_upload);
+    constexpr float kPwlToUnorm = 1.52737048e-05f;  // 1 / 65472
+    constexpr float kUnormToPwl = 65472.0f;
+    for (int c = 0; c < 3; ++c) {
+      float graded[128];
+      for (int i = 0; i < 128; ++i) {
+        graded[i] = GradeChannel(g, float(pwl[i * 3 + c].base) * kPwlToUnorm, c);
+      }
+      for (int i = 0; i < 128; ++i) {
+        uint32_t base = uint32_t(graded[i] * kUnormToPwl + 0.5f);
+        if (base > 0xFFFFu) {
+          base = 0xFFFFu;
+        }
+        float slope = (i + 1 < 128) ? (graded[i + 1] - graded[i]) : 0.0f;
+        if (slope < 0.0f) {
+          slope = 0.0f;
+        }
+        uint32_t delta = uint32_t(slope * kUnormToPwl + 0.5f);
+        if (delta > 0xFFFFu) {
+          delta = 0xFFFFu;
+        }
+        pwl[i * 3 + c].base = uint16_t(base);
+        pwl[i * 3 + c].delta = uint16_t(delta);
+      }
+    }
+  } else {
+    auto* table = reinterpret_cast<rex::graphics::reg::DC_LUT_30_COLOR*>(ramp_upload);
+    auto encode = [](float v) -> uint32_t {
+      uint32_t q = uint32_t(v * 1023.0f + 0.5f);
+      return q > 1023u ? 1023u : q;
+    };
+    for (int i = 0; i < 256; ++i) {
+      rex::graphics::reg::DC_LUT_30_COLOR e = table[i];
+      e.color_10_red = encode(GradeChannel(g, float(e.color_10_red) / 1023.0f, 0));
+      e.color_10_green = encode(GradeChannel(g, float(e.color_10_green) / 1023.0f, 1));
+      e.color_10_blue = encode(GradeChannel(g, float(e.color_10_blue) / 1023.0f, 2));
+      table[i] = e;
+    }
+  }
+}
+
+}  // namespace
 
 REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "When async shader compilation is enabled, skip presenting frames that "
@@ -2431,11 +2561,13 @@ void VulkanCommandProcessor::MaybeApplyLiveTune() {
 
   // Data dump — current value of every tuning knob.
   REXGPU_WARN(
-      "[MW2-TUNE] applied '{}' | ambient={} fog={} lightmap={} model={} | exposure={} sat={} "
-      "tint=({},{},{})",
+      "[MW2-TUNE] applied '{}' | ambient={} fog={} bloom={} lightmap={} model={} | exposure={} "
+      "gamma={} tonemap_white={} sat={} tint=({},{},{})",
       tune_file, rex::cvar::Query<double>("lightprobe_ambient_scale"),
-      rex::cvar::Query<double>("fog_color_scale"), new_lightmap, new_model,
-      rex::cvar::Query<double>("scene_exposure"), rex::cvar::Query<double>("scene_saturation"),
+      rex::cvar::Query<double>("fog_color_scale"),
+      rex::cvar::Query<double>("bloom_intensity_scale"), new_lightmap, new_model,
+      rex::cvar::Query<double>("scene_exposure"), rex::cvar::Query<double>("scene_gamma"),
+      rex::cvar::Query<double>("scene_tonemap_white"), rex::cvar::Query<double>("scene_saturation"),
       rex::cvar::Query<double>("scene_tint_r"), rex::cvar::Query<double>("scene_tint_g"),
       rex::cvar::Query<double>("scene_tint_b"));
 }
@@ -2447,6 +2579,28 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   vertex_buffers_in_sync_[1] = 0;
 
   MaybeApplyLiveTune();
+
+  // Force a gamma-ramp re-upload when a display-grade cvar changes (via the F4 overlay or the
+  // live-tune file), so the grade re-bakes even on frames where the guest didn't rewrite its ramp.
+  // The grade itself is applied in the ramp-upload block below; here we only invalidate.
+  {
+    DisplayGrade grade = QueryDisplayGrade();
+    static DisplayGrade s_last_grade;
+    static bool s_grade_initialized = false;
+    if (!s_grade_initialized || !(grade == s_last_grade)) {
+      s_grade_initialized = true;
+      s_last_grade = grade;
+      OnGammaRamp256EntryTableValueWritten();
+      OnGammaRampPWLValueWritten();
+    }
+    static bool s_saturation_warned = false;
+    if (!s_saturation_warned && float(REXCVAR_GET(scene_saturation)) != 1.0f) {
+      s_saturation_warned = true;
+      REXGPU_WARN(
+          "scene_saturation is set but is NOT applied: saturation is cross-channel and cannot be "
+          "baked into the per-channel swap gamma ramp (needs the apply-gamma shader). Ignored.");
+    }
+  }
 
   if (!graphics_system_)
     return;
@@ -2771,6 +2925,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                         use_pwl_gamma_ramp ? static_cast<const void*>(gamma_ramp_pwl_rgb())
                                            : static_cast<const void*>(gamma_ramp_256_entry_table()),
                         gamma_ramp_size);
+          }
+          // Bake the display grade into the ramp output (LE host only; the BE PWL branch above
+          // byte-swaps base/delta so the struct view wouldn't match). No-op when grade is identity.
+          if (std::endian::native == std::endian::little) {
+            ApplyDisplayGradeToRamp(gamma_ramp_frame_upload, use_pwl_gamma_ramp,
+                                    QueryDisplayGrade());
           }
           bool gamma_ramp_has_upload_buffer = gamma_ramp_upload_buffer_memory_ != VK_NULL_HANDLE;
           VkPipelineStageFlags gamma_ramp_read_stage_mask =
@@ -7051,6 +7211,46 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           }
         }
       }
+      // IW4 glow/bloom-intensity fingerprint — see the bloom_intensity_scale cvar above. A shader
+      // is the glow composite iff it has BOTH a cutoff const (rgb all-equal NEGATIVE ~-0.05, w~4)
+      // and an intensity const (rgb all-equal POSITIVE ~1.5, small desat w<0.6). When both are
+      // present, mark the intensity const(s) to scale. Two-const co-occurrence makes this robust
+      // against stray grays.
+      const float kBloomScale = float(REXCVAR_GET(bloom_intensity_scale));
+      const bool apply_bloom_scale = kBloomScale > 0.0f && std::fabs(kBloomScale - 1.0f) > 1e-4f;
+      std::array<bool, 256> bloom_scale_mask{};
+      if (apply_bloom_scale) {
+        bool has_cutoff = false;
+        uint32_t intensity_cidx[256];
+        uint32_t intensity_n = 0;
+        for (uint32_t i = 0; i < 4; ++i) {
+          uint64_t m = current_float_constant_map_pixel_[i];
+          uint32_t fi;
+          while (rex::bit_scan_forward(m, &fi)) {
+            m &= ~(1ull << fi);
+            const uint32_t cidx = (i << 6) + fi;
+            float c[4];
+            for (int k = 0; k < 4; ++k) {
+              uint32_t u = regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (cidx << 2) + k];
+              std::memcpy(&c[k], &u, 4);
+            }
+            const float mx = std::max(c[0], std::max(c[1], c[2]));
+            const float mn = std::min(c[0], std::min(c[1], c[2]));
+            const bool rgb_equal = (mx - mn) < 0.01f;
+            if (rgb_equal && c[0] < -0.001f && c[0] > -0.5f && c[3] > 2.0f && c[3] < 8.0f) {
+              has_cutoff = true;  // the bloom cutoff const
+            }
+            if (rgb_equal && c[0] > 0.1f && c[0] < 8.0f && c[3] >= 0.0f && c[3] < 0.6f) {
+              intensity_cidx[intensity_n++] = cidx;  // candidate intensity const
+            }
+          }
+        }
+        if (has_cutoff) {
+          for (uint32_t a = 0; a < intensity_n; ++a) {
+            bloom_scale_mask[intensity_cidx[a]] = true;
+          }
+        }
+      }
       for (uint32_t i = 0; i < 4; ++i) {
         uint64_t float_constant_map_entry = current_float_constant_map_pixel_[i];
         uint32_t float_constant_index;
@@ -7100,6 +7300,14 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
             dst[0] *= kFogScale;
             dst[1] *= kFogScale;
             dst[2] *= kFogScale;
+          }
+          // IW4 glow/bloom-intensity fix: scale the rgb of the fingerprinted glow-intensity const
+          // (preserving the desat in w). Self-gated; only the glow composite shader is touched.
+          if (apply_bloom_scale && bloom_scale_mask[cidx]) {
+            float* dst = reinterpret_cast<float*>(mapping);
+            dst[0] *= kBloomScale;
+            dst[1] *= kBloomScale;
+            dst[2] *= kBloomScale;
           }
           mapping += sizeof(float) * 4;
         }
