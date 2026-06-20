@@ -107,6 +107,16 @@ REXCVAR_DEFINE_DOUBLE(fog_color_scale, 1.0, "GPU/Vulkan",
                       "Scale the IW4 HDR atmospheric fog color (base + sun-fog) PS constants to "
                       "restore the haze that brightens the sky and lifts shadows (1.0 = off)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// The IW4 fog color is WARM (~0.31,0.23,0.22 = orange); scaling it bright (fog_color_scale) makes a
+// warm veil that casts mid-ground geometry yellow, unlike the real-hardware reference's
+// neutral-gray haze. This pushes the fingerprinted fog color toward its own luma (gray) before the
+// scale, so the brightened haze stays neutral. 0 = keep the warm hue, 1 = fully gray. Applied to
+// the same fog consts as fog_color_scale.
+REXCVAR_DEFINE_DOUBLE(
+    fog_color_neutralize, 0.0, "GPU/Vulkan",
+    "Desaturate the IW4 fog color toward gray before fog_color_scale, so a bright "
+    "haze stays neutral instead of warm/yellow (0 = off, 1 = fully gray)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // IW4 glow/bloom intensity. The glow composite shader (RenderDoc ps=1400) holds
 // r_glowBloomIntensity as a PS float const with rgb all-equal (~1.5) and a small desat in w (~0.2),
@@ -175,9 +185,9 @@ namespace {
 // The display grade is baked into the swap apply-gamma RAMP (the per-frame 256-entry table or PWL
 // LUT every apply-gamma variant reads), so it covers ALL present paths without per-shader SPIR-V
 // surgery. A ramp is a per-channel 1D transfer function, so it carries exposure (global scale),
-// per-channel tint, and gamma (per-channel pow) exactly. SATURATION is cross-channel and CANNOT be
-// expressed in a per-channel ramp — scene_saturation needs the apply-gamma shader and is not wired
-// here (a one-time warning fires if it is set non-identity).
+// per-channel tint, and gamma (per-channel pow) exactly. SATURATION is cross-channel so it CANNOT
+// live in the ramp — scene_saturation is applied separately in a runtime-compiled apply-gamma
+// compute shader (see GetSwapApplyGammaSaturationComputeSource / the selection in IssueSwap).
 struct DisplayGrade {
   float exposure = 1.0f;
   float tint[3] = {1.0f, 1.0f, 1.0f};
@@ -741,6 +751,64 @@ void main() {
   imageStore(xe_apply_gamma_dest, pixel, vec4(rgb, dot(rgb, kLumaWeights)));
 }
 )";
+}
+
+// Builds an apply-gamma compute shader (non-FXAA) with the cross-channel display-grade SATURATION
+// step baked in: after the per-channel gamma-ramp lookup gives the final display rgb, apply
+// rgb = clamp(mix(luma(rgb), rgb, saturation)). The ramp read order (.b/.g/.r) and the source
+// swizzle (.rgb vs .bgr for the imageViewFormatSwizzle red/blue fallback) match the precompiled
+// apply_gamma_*_cs variants. The saturation value is baked as a literal (recompiled on change), so
+// no push-constant change is needed and the precompiled pipelines stay untouched.
+std::string GetSwapApplyGammaSaturationComputeSource(bool use_pwl, bool rb_swap, float saturation) {
+  char sat[32];
+  std::snprintf(sat, sizeof(sat), "%.6f", saturation);
+  const char* swiz = rb_swap ? "bgr" : "rgb";
+  std::string s =
+      "#version 450\n"
+      "#extension GL_EXT_samplerless_texture_functions : require\n"
+      "layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;\n"
+      "layout(push_constant) uniform XeApplyGammaRampConstants { uvec2 xe_apply_gamma_size; };\n";
+  s += use_pwl ? "layout(set = 0, binding = 0) uniform utextureBuffer xe_apply_gamma_ramp;\n"
+               : "layout(set = 0, binding = 0) uniform textureBuffer xe_apply_gamma_ramp;\n";
+  s += "layout(set = 1, binding = 0) uniform texture2D xe_apply_gamma_source;\n"
+       "layout(set = 2, binding = 0, rgb10_a2) writeonly uniform image2D xe_apply_gamma_dest;\n";
+  if (use_pwl) {
+    s += "float ApplyPwl(uint v, uint ch) {\n"
+         "  uint b = v >> 3u;\n"
+         "  uvec4 p = texelFetch(xe_apply_gamma_ramp, int(b * 3u + ch));\n"
+         "  float val = float(p.x) + float((v & 7u) * p.y) * 0.125;\n"
+         "  return clamp(val * 1.52737048e-05, 0.0, 1.0);\n"
+         "}\n";
+  }
+  s += "void main() {\n"
+       "  ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);\n"
+       "  if (any(greaterThanEqual(uvec2(pixel), xe_apply_gamma_size))) return;\n";
+  if (use_pwl) {
+    s += std::string(
+             "  uvec3 source = uvec3(texelFetch(xe_apply_gamma_source, pixel, 0).rgb * 1023.0 + "
+             "vec3(0.5)).") +
+         swiz +
+         ";\n"
+         "  vec3 c = vec3(ApplyPwl(source.r, 0u), ApplyPwl(source.g, 1u), ApplyPwl(source.b, "
+         "2u));\n";
+  } else {
+    s += std::string(
+             "  uvec3 source = uvec3(texelFetch(xe_apply_gamma_source, pixel, 0).rgb * 255.0 + "
+             "vec3(0.5)).") +
+         swiz +
+         ";\n"
+         "  vec3 c = vec3(texelFetch(xe_apply_gamma_ramp, int(source.r)).b,\n"
+         "                texelFetch(xe_apply_gamma_ramp, int(source.g)).g,\n"
+         "                texelFetch(xe_apply_gamma_ramp, int(source.b)).r);\n";
+  }
+  s += std::string(
+           "  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));\n"
+           "  c = clamp(mix(vec3(l), c, ") +
+       sat +
+       "), 0.0, 1.0);\n"
+       "  imageStore(xe_apply_gamma_dest, pixel, vec4(c, 1.0));\n"
+       "}\n";
+  return s;
 }
 
 bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
@@ -2221,6 +2289,8 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          swap_fxaa_extreme_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_fxaa_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                         swap_apply_gamma_compute_saturation_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_apply_gamma_compute_pwl_pipeline_);
@@ -2604,13 +2674,6 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       OnGammaRamp256EntryTableValueWritten();
       OnGammaRampPWLValueWritten();
     }
-    static bool s_saturation_warned = false;
-    if (!s_saturation_warned && float(REXCVAR_GET(scene_saturation)) != 1.0f) {
-      s_saturation_warned = true;
-      REXGPU_WARN(
-          "scene_saturation is set but is NOT applied: saturation is cross-channel and cannot be "
-          "baked into the per-channel swap gamma ramp (needs the apply-gamma shader). Ignored.");
-    }
   }
 
   if (!graphics_system_)
@@ -2883,6 +2946,50 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         if (!use_fxaa) {
           swap_apply_gamma_compute_pipeline =
               select_swap_apply_gamma_compute_pipeline(use_pwl_gamma_ramp, false);
+        }
+        // Display-grade SATURATION (cross-channel, can't live in the per-channel gamma ramp): when
+        // scene_saturation != 1.0, swap in a runtime-compiled apply-gamma compute pipeline that
+        // also applies mix(luma, rgb, saturation). Same layout/descriptors/push-constant as the
+        // precompiled variants, so it's a drop-in. Rebuilt only when the value or table/PWL/rb-swap
+        // variant changes; awaits prior frames before destroying the old pipeline (rebuild is
+        // rare).
+        if (!use_fxaa && swap_apply_gamma_compute_pipeline != VK_NULL_HANDLE) {
+          const float saturation = float(REXCVAR_GET(scene_saturation));
+          if (saturation != 1.0f && saturation >= 0.0f) {
+            if (swap_apply_gamma_compute_saturation_pipeline_ == VK_NULL_HANDLE ||
+                swap_apply_gamma_saturation_value_ != saturation ||
+                swap_apply_gamma_saturation_use_pwl_ != use_pwl_gamma_ramp ||
+                swap_apply_gamma_saturation_rb_swap_ != swap_source_requires_compute_rb_swap) {
+              if (swap_apply_gamma_compute_saturation_pipeline_ != VK_NULL_HANDLE) {
+                AwaitAllQueueOperationsCompletion();
+              }
+              ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                                     swap_apply_gamma_compute_saturation_pipeline_);
+              std::string sat_source = GetSwapApplyGammaSaturationComputeSource(
+                  use_pwl_gamma_ramp, swap_source_requires_compute_rb_swap, saturation);
+              std::vector<uint32_t> sat_spirv;
+              std::string sat_error;
+              if (CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, sat_source, sat_spirv,
+                                     sat_error)) {
+                swap_apply_gamma_compute_saturation_pipeline_ =
+                    ui::vulkan::util::CreateComputePipeline(
+                        vulkan_device, swap_apply_gamma_compute_pipeline_layout_, sat_spirv.data(),
+                        sizeof(uint32_t) * sat_spirv.size());
+              } else {
+                static bool sat_compile_failed_logged = false;
+                if (!sat_compile_failed_logged) {
+                  sat_compile_failed_logged = true;
+                  REXGPU_WARN("Failed to compile the saturation apply-gamma shader: {}", sat_error);
+                }
+              }
+              swap_apply_gamma_saturation_value_ = saturation;
+              swap_apply_gamma_saturation_use_pwl_ = use_pwl_gamma_ramp;
+              swap_apply_gamma_saturation_rb_swap_ = swap_source_requires_compute_rb_swap;
+            }
+            if (swap_apply_gamma_compute_saturation_pipeline_ != VK_NULL_HANDLE) {
+              swap_apply_gamma_compute_pipeline = swap_apply_gamma_compute_saturation_pipeline_;
+            }
+          }
         }
         if (swap_source_requires_compute_rb_swap &&
             swap_apply_gamma_compute_pipeline == VK_NULL_HANDLE) {
@@ -7188,7 +7295,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       // at another used slot in this shader (the baseFog/sunFog-base duplication observed in
       // RenderDoc).
       const float kFogScale = float(REXCVAR_GET(fog_color_scale));
-      const bool apply_fog_scale = kFogScale > 0.0f && std::fabs(kFogScale - 1.0f) > 1e-4f;
+      const float kFogNeutralize = float(REXCVAR_GET(fog_color_neutralize));
+      const bool apply_fog_scale =
+          (kFogScale > 0.0f && std::fabs(kFogScale - 1.0f) > 1e-4f) || kFogNeutralize > 1e-4f;
       std::array<bool, 256> fog_scale_mask{};
       if (apply_fog_scale) {
         // Gather used (cidx, rgb, w) for fog-candidate colors.
@@ -7322,6 +7431,14 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           // material / 2D consts are untouched.
           if (apply_fog_scale && fog_scale_mask[cidx]) {
             float* dst = reinterpret_cast<float*>(mapping);
+            if (kFogNeutralize > 0.0f) {
+              // Desaturate toward the fog color's own luma (gray) so the brightened haze is neutral
+              // instead of warm/yellow, then scale.
+              const float l = 0.2126f * dst[0] + 0.7152f * dst[1] + 0.0722f * dst[2];
+              dst[0] += (l - dst[0]) * kFogNeutralize;
+              dst[1] += (l - dst[1]) * kFogNeutralize;
+              dst[2] += (l - dst[2]) * kFogNeutralize;
+            }
             dst[0] *= kFogScale;
             dst[1] *= kFogScale;
             dst[2] *= kFogScale;

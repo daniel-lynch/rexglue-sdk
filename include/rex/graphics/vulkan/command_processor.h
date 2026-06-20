@@ -730,6 +730,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_apply_gamma_compute_256_entry_table_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
+  // Display-grade SATURATION: a runtime-compiled apply-gamma compute pipeline with the
+  // cross-channel saturation step (mix(luma, rgb, scene_saturation)) baked in. Built lazily when
+  // scene_saturation
+  // != 1.0 and rebuilt when the value / variant changes (saturation can't live in the per-channel
+  // gamma ramp). See EnsureSwapApplyGammaSaturationPipeline.
+  VkPipeline swap_apply_gamma_compute_saturation_pipeline_ = VK_NULL_HANDLE;
+  float swap_apply_gamma_saturation_value_ = 1.0f;
+  bool swap_apply_gamma_saturation_use_pwl_ = false;
+  bool swap_apply_gamma_saturation_rb_swap_ = false;
   VkPipeline swap_fxaa_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_fxaa_extreme_pipeline_ = VK_NULL_HANDLE;
   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
