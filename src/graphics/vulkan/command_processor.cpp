@@ -2626,27 +2626,32 @@ void VulkanCommandProcessor::MaybeApplyLiveTune() {
 
   const double old_lightmap = rex::cvar::Query<double>("lightmap_scale");
   const double old_model = rex::cvar::Query<double>("model_lighting_scale");
+  const double old_sky_cube = rex::cvar::Query<double>("sky_cube_scale");
   rex::cvar::LoadConfig(tune_file);
   const double new_lightmap = rex::cvar::Query<double>("lightmap_scale");
   const double new_model = rex::cvar::Query<double>("model_lighting_scale");
+  const double new_sky_cube = rex::cvar::Query<double>("sky_cube_scale");
 
-  // The texture-scale cvars are baked into textures at decode time, so resident lightmaps/volumes
-  // keep the old scale until evicted. On a change, drain the GPU and clear the cache to force a
-  // re-decode. Skip on the very first apply (nothing resident yet that needs rescaling).
-  if (!first_apply && texture_cache_ && (new_lightmap != old_lightmap || new_model != old_model)) {
+  // The texture-scale cvars are baked into textures at decode time, so resident lightmaps/volumes/
+  // sky cubes keep the old scale until evicted. On a change, drain the GPU and clear the cache to
+  // force a re-decode (sky_cube_scale also flips the cube's host format compressed<->RGBA8 across
+  // the 1.0 boundary, which ClearCache re-resolves via GetHostFormatPair). Skip on the very first
+  // apply (nothing resident yet that needs rescaling).
+  if (!first_apply && texture_cache_ &&
+      (new_lightmap != old_lightmap || new_model != old_model || new_sky_cube != old_sky_cube)) {
     AwaitAllQueueOperationsCompletion();
     texture_cache_->ClearCache();
-    REXGPU_WARN("[MW2-TUNE] texture cache cleared (lightmap {}->{}, model {}->{})", old_lightmap,
-                new_lightmap, old_model, new_model);
+    REXGPU_WARN("[MW2-TUNE] texture cache cleared (lightmap {}->{}, model {}->{}, sky_cube {}->{})",
+                old_lightmap, new_lightmap, old_model, new_model, old_sky_cube, new_sky_cube);
   }
 
   // Data dump — current value of every tuning knob.
   REXGPU_WARN(
-      "[MW2-TUNE] applied '{}' | ambient={} fog={} fogdensity={} bloom={} lightmap={} model={} | "
-      "exposure={} gamma={} tonemap_white={} sat={} tint=({},{},{})",
+      "[MW2-TUNE] applied '{}' | ambient={} fog={} fogdensity={} bloom={} lightmap={} model={} "
+      "sky_cube={} | exposure={} gamma={} tonemap_white={} sat={} tint=({},{},{})",
       tune_file, rex::cvar::Query<double>("lightprobe_ambient_scale"),
       rex::cvar::Query<double>("fog_color_scale"), rex::cvar::Query<double>("fog_density_scale"),
-      rex::cvar::Query<double>("bloom_intensity_scale"), new_lightmap, new_model,
+      rex::cvar::Query<double>("bloom_intensity_scale"), new_lightmap, new_model, new_sky_cube,
       rex::cvar::Query<double>("scene_exposure"), rex::cvar::Query<double>("scene_gamma"),
       rex::cvar::Query<double>("scene_tonemap_white"), rex::cvar::Query<double>("scene_saturation"),
       rex::cvar::Query<double>("scene_tint_r"), rex::cvar::Query<double>("scene_tint_g"),

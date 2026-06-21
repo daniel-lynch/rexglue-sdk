@@ -60,6 +60,22 @@ REXCVAR_DEFINE_DOUBLE(model_lighting_scale, 1.0, "GPU/Vulkan",
                       "Scale RGB of the IW4 modelLighting 3D volume to correct too-dark "
                       "dynamic-model (viewmodel/character) indirect lighting (1.0 = off)");
 
+// MW2 skybox HDR fix (Track B of the dark-scene issue): the IW4 sky is an unlit cube-map material
+// whose pixel shader SQUARES the sampled cube (faithful guest microcode: OUT = cube*cube, a
+// ~gamma-2.0 linearize of the gamma-encoded BC1 texels). On the 360 the output gamma re-encode
+// re-lifts it; our HDR (R16G16B16A16) sky-RT path drops that re-encode, so the bright (~0.71) sky
+// cube renders dark (~0.18 = 0.42^2). The cube is BC1 (block-compressed) so its RGB cannot be
+// scaled in place; this cvar instead (1) forces the large sky cube to decompress to RGBA8 in
+// GetHostFormatPair, and (2) runs the existing 32bpb rgb_scale load shader as a second in-place
+// pass over the decoded texels in LoadTextureDataFromResidentMemoryImpl. Because the sky PS squares
+// the result the relationship is QUADRATIC (output ~= (cube*scale)^2), and the LDR RGBA8 cube
+// clamps bright texels at 1.0 (fine — the dim visible horizon strip is what needs lifting).
+// Signature: BC1 (k_DXT1) cube >= 256px, which excludes the 64x64 env-probe reflection cube. 1.0 =
+// off (the cube stays native BC1 and no second pass runs).
+REXCVAR_DEFINE_DOUBLE(sky_cube_scale, 1.0, "GPU/Vulkan",
+                      "Scale RGB of the large IW4 BC1 sky cube to correct the too-dark squared "
+                      "skybox (1.0 = off; quadratic, tune ~1.5-2.5 to match reference)");
+
 namespace rex::graphics::vulkan {
 
 // Generated with `xb buildshaders`.
@@ -1768,6 +1784,108 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     }
   }
 
+  // MW2 skybox HDR fix (sky_cube_scale): second in-place pass scaling the decoded RGBA8 sky-cube
+  // texels. The cube was force-decompressed to RGBA8 in GetHostFormatPair (above) when the cvar is
+  // enabled, so here we run the existing 32bpb load shader's rgb_scale path over the scratch buffer
+  // in place (source == destination == scratch_buffer, linear addressing, host RGBA8 blocks = 1px).
+  // Gated on the same BC1-cube >= 256px signature; off (== 1.0) skips entirely. See the cvar
+  // comment.
+  if (REXCVAR_GET(sky_cube_scale) != 1.0 &&
+      (texture_key.format == xenos::TextureFormat::k_DXT1 ||
+       texture_key.format == xenos::TextureFormat::k_DXT1_AS_16_16_16_16) &&
+      texture_key.dimension == xenos::DataDimension::kCube && texture_key.GetWidth() >= 256) {
+    const LoadShaderInfo& scale_info = GetLoadShaderInfo(kLoadShaderIndex32bpb);
+    VkPipeline scale_pipeline = texture_key.scaled_resolve
+                                    ? load_pipelines_scaled_[kLoadShaderIndex32bpb]
+                                    : load_pipelines_[kLoadShaderIndex32bpb];
+    if (scale_pipeline != VK_NULL_HANDLE) {
+      // Make the freshly decoded RGBA8 data readable and keep it writable for the in-place scale.
+      command_processor_.PushBufferMemoryBarrier(
+          scratch_buffer, 0, VK_WHOLE_SIZE,
+          scratch_buffer_acquisition.SetStageMask(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          scratch_buffer_acquisition.SetAccessMask(VK_ACCESS_SHADER_READ_BIT |
+                                                   VK_ACCESS_SHADER_WRITE_BIT),
+          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+
+      command_processor_.BindExternalComputePipeline(scale_pipeline);
+      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_layout_,
+                                             kLoadDescriptorSetIndexDestination, 1,
+                                             &descriptor_set_dest, 0, nullptr);
+      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_layout_,
+                                             kLoadDescriptorSetIndexSource, 1, &descriptor_set_dest,
+                                             0, nullptr);
+
+      LoadConstants load_constants_scale;
+      load_constants_scale.rgb_scale = float(REXCVAR_GET(sky_cube_scale));
+      // Linear source and destination in the same scratch buffer, 1x1, host RGBA8 (32bpb) blocks.
+      load_constants_scale.is_tiled_3d_endian_scale =
+          (uint32_t(is_3d) << 1) | (UINT32_C(1) << 4) | (UINT32_C(1) << 7);
+      uint32_t scale_x_blocks_per_group_log2 = scale_info.GetGuestXBlocksPerGroupLog2();
+
+      for (uint32_t loop_level = loop_level_first; loop_level <= loop_level_last; ++loop_level) {
+        bool is_base = loop_level == 0;
+        uint32_t level = (level_packed == 0) ? 0 : loop_level;
+
+        const texture_util::TextureGuestLayout::Level& level_guest_layout =
+            is_base ? guest_layout.base : guest_layout.mips[level];
+        uint32_t level_width, level_height, level_depth;
+        if (level == level_packed) {
+          level_width = level_guest_layout.x_extent_blocks * block_width;
+          level_height = level_guest_layout.y_extent_blocks * block_height;
+          level_depth = level_guest_layout.z_extent;
+        } else {
+          level_width = std::max(width >> level, UINT32_C(1));
+          level_height = std::max(height >> level, UINT32_C(1));
+          level_depth = std::max(depth >> level, UINT32_C(1));
+        }
+        // Host RGBA8 blocks are 1x1 px (unlike the guest DXT1 4x4 blocks), so size in pixels.
+        load_constants_scale.size_blocks[0] = level_width * texture_resolution_scale_x;
+        load_constants_scale.size_blocks[1] = level_height * texture_resolution_scale_y;
+        load_constants_scale.size_blocks[2] = level_depth;
+        load_constants_scale.height_texels = level_height;
+
+        uint32_t group_count_x = (load_constants_scale.size_blocks[0] +
+                                  ((UINT32_C(1) << scale_x_blocks_per_group_log2) - 1)) >>
+                                 scale_x_blocks_per_group_log2;
+        uint32_t group_count_y = (load_constants_scale.size_blocks[1] +
+                                  ((UINT32_C(1) << kLoadGuestYBlocksPerGroupLog2) - 1)) >>
+                                 kLoadGuestYBlocksPerGroupLog2;
+
+        const HostLayout& level_host_layout = is_base ? host_layout_base : host_layout_mips[level];
+        load_constants_scale.guest_offset = uint32_t(level_host_layout.offset_bytes);
+        load_constants_scale.guest_pitch_aligned =
+            scale_info.bytes_per_host_block * level_host_layout.x_pitch_blocks;
+        load_constants_scale.guest_z_stride_block_rows_aligned = level_host_layout.y_pitch_blocks;
+        load_constants_scale.host_offset = uint32_t(level_host_layout.offset_bytes);
+        load_constants_scale.host_pitch =
+            scale_info.bytes_per_host_block * level_host_layout.x_pitch_blocks;
+
+        command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                          sizeof(load_constants_scale), &load_constants_scale);
+
+        uint32_t level_array_slice_stride_bytes = uint32_t(level_host_layout.slice_size_bytes);
+        for (uint32_t slice = 0; slice < array_size; ++slice) {
+          if (slice != 0) {
+            command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                                              offsetof(LoadConstants, guest_offset),
+                                              sizeof(load_constants_scale.guest_offset),
+                                              &load_constants_scale.guest_offset);
+            command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                                              offsetof(LoadConstants, host_offset),
+                                              sizeof(load_constants_scale.host_offset),
+                                              &load_constants_scale.host_offset);
+          }
+          command_processor_.SubmitBarriers(true);
+          command_buffer.CmdVkDispatch(group_count_x, group_count_y,
+                                       load_constants_scale.size_blocks[2]);
+          load_constants_scale.guest_offset += level_array_slice_stride_bytes;
+          load_constants_scale.host_offset += level_array_slice_stride_bytes;
+        }
+      }
+    }
+  }
+
   // Submit copying from the copy buffer to the host texture.
   command_processor_.PushBufferMemoryBarrier(
       scratch_buffer, 0, VK_WHOLE_SIZE,
@@ -3189,6 +3307,17 @@ bool VulkanTextureCache::Initialize() {
 
 const VulkanTextureCache::HostFormatPair& VulkanTextureCache::GetHostFormatPair(
     TextureKey key) const {
+  // MW2 skybox HDR fix (sky_cube_scale): when enabled, force the large BC1 sky cube to decompress
+  // to RGBA8 so its RGB can be scaled in place by the second-pass load shader. Off (== 1.0) keeps
+  // the native BC1 block passthrough (byte-identical default). Must precede the block_compressed
+  // early-out below. See the sky_cube_scale cvar at the top of this file. Routed through the same
+  // unaligned-decompress pair used as the BC1 fallback so views/samplers/loads stay consistent.
+  if ((key.format == xenos::TextureFormat::k_DXT1 ||
+       key.format == xenos::TextureFormat::k_DXT1_AS_16_16_16_16) &&
+      key.dimension == xenos::DataDimension::kCube && key.GetWidth() >= 256 &&
+      REXCVAR_GET(sky_cube_scale) != 1.0) {
+    return kHostFormatDXT1Unaligned;
+  }
   const HostFormatPair& host_format_pair = host_formats_[uint32_t(key.format)];
   if (!host_format_pair.format_unsigned.block_compressed &&
       !host_format_pair.format_signed.block_compressed) {
