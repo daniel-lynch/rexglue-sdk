@@ -179,6 +179,14 @@ REXCVAR_DEFINE_DOUBLE(scene_tonemap_white, 0.0, "GPU/Vulkan",
                       "exposure+tint and before gamma (0 = off). Lets exposure lift dark midtones "
                       "while highlights roll off to <=1 at this value instead of clipping")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// The display grade is gated to in-game so it doesn't wash the menus/title. "In-game" = the frame
+// rendered at least this many depth-bound draws (the world renders hundreds; the frontend/title,
+// including its animated cloud background, renders only a handful). Tune if the title is still
+// graded (raise) or in-game loses its grade (lower). Hot-reloadable.
+REXCVAR_DEFINE_INT32(grade_min_3d_draws, 30, "GPU/Vulkan",
+                     "Min depth-bound draws in a frame for it to count as in-game (display-grade "
+                     "gate; menus/title render fewer)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace {
 
@@ -2669,8 +2677,15 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   // Force a gamma-ramp re-upload when a display-grade cvar changes (via the F4 overlay or the
   // live-tune file), so the grade re-bakes even on frames where the guest didn't rewrite its ramp.
   // The grade itself is applied in the ramp-upload block below; here we only invalidate.
+  // The display grade is gated to in-game: the world renders many depth-bound draws, while the
+  // menus/title render only a handful (the grade should not wash them). When not in-game the
+  // effective grade is identity.
+  const uint32_t grade_depth_draws =
+      render_target_cache_ ? render_target_cache_->DepthDrawCountThisFrame() : 0u;
+  const bool grade_in_game =
+      grade_depth_draws >= uint32_t(std::max(0, int(REXCVAR_GET(grade_min_3d_draws))));
   {
-    DisplayGrade grade = QueryDisplayGrade();
+    DisplayGrade grade = grade_in_game ? QueryDisplayGrade() : DisplayGrade{};
     static DisplayGrade s_last_grade;
     static bool s_grade_initialized = false;
     if (!s_grade_initialized || !(grade == s_last_grade)) {
@@ -2864,7 +2879,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
-       swap_post_effect,
+       swap_post_effect, grade_in_game,
        swap_source_needs_rb_swap](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
@@ -2959,7 +2974,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         // variant changes; awaits prior frames before destroying the old pipeline (rebuild is
         // rare).
         if (!use_fxaa && swap_apply_gamma_compute_pipeline != VK_NULL_HANDLE) {
-          const float saturation = float(REXCVAR_GET(scene_saturation));
+          // Gated to in-game (identity saturation on menus/title, like the rest of the grade).
+          const float saturation = grade_in_game ? float(REXCVAR_GET(scene_saturation)) : 1.0f;
           if (saturation != 1.0f && saturation >= 0.0f) {
             if (swap_apply_gamma_compute_saturation_pipeline_ == VK_NULL_HANDLE ||
                 swap_apply_gamma_saturation_value_ != saturation ||
@@ -3051,9 +3067,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           }
           // Bake the display grade into the ramp output (LE host only; the BE PWL branch above
           // byte-swaps base/delta so the struct view wouldn't match). No-op when grade is identity.
+          // Gated to in-game so menus/title render with the stock ramp.
           if (std::endian::native == std::endian::little) {
             ApplyDisplayGradeToRamp(gamma_ramp_frame_upload, use_pwl_gamma_ramp,
-                                    QueryDisplayGrade());
+                                    grade_in_game ? QueryDisplayGrade() : DisplayGrade{});
           }
           bool gamma_ramp_has_upload_buffer = gamma_ramp_upload_buffer_memory_ != VK_NULL_HANDLE;
           VkPipelineStageFlags gamma_ramp_read_stage_mask =

@@ -126,6 +126,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                                          VkRenderingAttachmentInfo* depth_attachment,
                                          VkRenderingAttachmentInfo* stencil_attachment) const;
 
+  // Number of draws this guest frame that bound a depth render target. The in-game world renders
+  // hundreds; the frontend/title (even with its animated cloud background) renders only a handful,
+  // so the command processor thresholds this to gate the display grade to in-game (the grade should
+  // not wash the menus/title). Reset at each frame boundary.
+  uint32_t DepthDrawCountThisFrame() const { return depth_draws_this_frame_; }
+
   // Using R16G16[B16A16]_SNORM, which are -1...1, not the needed -32...32.
   // Persistent data doesn't depend on this, so can be overriden by per-game
   // configuration.
@@ -289,6 +295,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   const RenderTarget* const*
       last_update_framebuffer_attachments_[1 + xenos::kMaxColorRenderTargets] = {};
   const Framebuffer* last_update_framebuffer_ = VK_NULL_HANDLE;
+
+  // In-game detection for gating the display grade (see DepthDrawCountThisFrame).
+  uint32_t depth_draws_this_frame_ = 0;
+  uint64_t rendered_3d_frame_ = ~0ull;
 
   // For host render targets.
 

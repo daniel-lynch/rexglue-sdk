@@ -1601,6 +1601,19 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
 
+      // In-game detection for the display-grade gate: count depth-bound draws (the world renders
+      // hundreds; the title/frontend only a handful). Reset at the frame boundary.
+      {
+        const uint64_t frame = command_processor_.GetCurrentFrame();
+        if (rendered_3d_frame_ != frame) {
+          rendered_3d_frame_ = frame;
+          depth_draws_this_frame_ = 0;
+        }
+        if (depth_and_color_render_targets[0]) {
+          ++depth_draws_this_frame_;
+        }
+      }
+
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets, last_update_transfers());
 
