@@ -16,6 +16,7 @@
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/perf/counter.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
@@ -857,8 +858,10 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // previously 0, now not 0, to save memory - common case in streaming.
   auto found_texture_it = textures_.find(key);
   if (found_texture_it != textures_.end()) {
+    PROFILE_TEXTURE_CACHE_HIT();
     return found_texture_it->second.get();
   }
+  PROFILE_TEXTURE_CACHE_MISS();
 
   // Create the texture and add it to the map.
   Texture* texture;

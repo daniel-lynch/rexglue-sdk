@@ -36,6 +36,16 @@ constexpr const char* kCounterNames[] = {
     "draw_calls",
     "command_buffer_stalls",
     "vertices_processed",
+    "upload_time_us",
+    "emit_time_us",
+    "issue_draw_other_us",
+    "draw_shader_analysis_us",
+    "draw_sampler_us",
+    "draw_texture_us",
+    "draw_rt_update_us",
+    "draw_pipeline_us",
+    "draw_sys_const_us",
+    "draw_bindings_us",
     "xma_frames_decoded",
     "audio_frame_latency_us",
     "buffer_queue_depth",
@@ -59,6 +69,16 @@ constexpr bool kIsGauge[] = {
     false,  // kDrawCalls
     false,  // kCommandBufferStalls
     false,  // kVerticesProcessed
+    false,  // kUploadTimeUs        (set once per frame = per-frame total)
+    false,  // kEmitTimeUs          (set once per frame = per-frame total)
+    false,  // kIssueDrawOtherUs    (set once per frame = per-frame total)
+    false,  // kDrawShaderAnalysisUs (set once per frame = per-frame total)
+    false,  // kDrawSamplerUs        (set once per frame = per-frame total)
+    false,  // kDrawTextureUs        (set once per frame = per-frame total)
+    false,  // kDrawRtUpdateUs       (set once per frame = per-frame total)
+    false,  // kDrawPipelineUs       (set once per frame = per-frame total)
+    false,  // kDrawSysConstUs       (set once per frame = per-frame total)
+    false,  // kDrawBindingsUs       (set once per frame = per-frame total)
     false,  // kXmaFramesDecoded
     false,  // kAudioFrameLatencyUs
     false,  // kBufferQueueDepth  (set each frame)
@@ -153,6 +173,17 @@ void SetCsvLogPath(const std::string& path) {
 }
 
 void WriteCsvFrame() {
+  // Lazily honor the perf_log_csv cvar on the first frame (config is loaded by now, and there is
+  // no guaranteed post-config perf::Init hook). Opens the CSV + writes the header once.
+  static bool s_csv_cvar_checked = false;
+  if (!s_csv_cvar_checked) {
+    s_csv_cvar_checked = true;
+    const std::string& csv_path = REXCVAR_GET(perf_log_csv);
+    if (!csv_path.empty()) {
+      SetCsvLogPath(csv_path);
+    }
+  }
+
   if (!g_csv_file)
     return;
 

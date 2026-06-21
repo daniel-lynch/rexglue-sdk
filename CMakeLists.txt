@@ -22,8 +22,11 @@ option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter regi
 if(REXGLUE_ENABLE_TRACY)
     add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
 endif()
+# Perf counters are lightweight (atomic adds) and feed the F3 debug overlay, which is genuinely
+# useful in Release too (fps, frame-time graph, draws, stalls, cache hit rates). Enabled in all
+# configs when the option is on -- the overlay itself stays opt-in via the F3 toggle.
 if(REXGLUE_ENABLE_PERF_COUNTERS)
-    add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
+    add_compile_definitions(REXGLUE_ENABLE_PERF_COUNTERS)
 endif()
 
 # Graphics backend selection

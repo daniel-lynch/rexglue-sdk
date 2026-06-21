@@ -160,6 +160,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // RTs to shader-read, fills `out`, and returns true. The command processor then runs the pass.
   bool PrepareSunShadowReproject(SunShadowReprojectInputs& out);
 
+  // True only when `resolve_info` is the COLOR resolve of the recorded scene-color RT (matching
+  // EDRAM base). Resolve() gates MaybeReprojectSunShadow on this so the once-per-frame pass fires
+  // on the scene resolve -- not an earlier depth/SSAO/downsample resolve, which would blend into a
+  // surface that resolve doesn't dump to guest RAM (the displayed frame is re-resolved from guest
+  // RAM) and would burn the frame guard before the real scene resolve.
+  bool IsResolveOfRecordedSceneColor(const draw_util::ResolveInfo& resolve_info) const;
+
   // Using R16G16[B16A16]_SNORM, which are -1...1, not the needed -32...32.
   // Persistent data doesn't depend on this, so can be overriden by per-game
   // configuration.

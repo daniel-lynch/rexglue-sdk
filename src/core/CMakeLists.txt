@@ -98,7 +98,6 @@ endif()
 
 if(REXGLUE_ENABLE_PERF_COUNTERS)
     target_sources(rexcore PRIVATE perf/counter.cpp)
-    target_compile_definitions(rexcore PUBLIC
-        $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
+    target_compile_definitions(rexcore PUBLIC REXGLUE_ENABLE_PERF_COUNTERS)
 endif()
 

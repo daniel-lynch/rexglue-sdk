@@ -1358,7 +1358,19 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   // IW4 sun-shadow reproject (Track A): run the screen-space sun shadow into the scene color RT
   // before it is dumped/resolved (so bloom/tonemap see the darkened result). No-op unless enabled
   // and all inputs were recorded this frame; guarded to once per frame internally.
-  command_processor_.MaybeReprojectSunShadow();
+  //
+  // CRITICAL: only run at the resolve that actually resolves the recorded scene-color RT. A frame
+  // has many earlier resolves (sun shadowmap depth, SSAO/half-res color, downsamples); the
+  // reproject is once-per-frame, so if it fired on the first available resolve it would (a) blend
+  // into the scene-color host RT before the world finished drawing (then get overwritten) and (b)
+  // be consumed by the frame guard so the real scene resolve never runs it -- and that earlier
+  // resolve dumps a DIFFERENT EDRAM range, so the darkening would never reach guest RAM / the swap
+  // (the displayed frame is re-resolved from guest RAM via RequestSwapTexture, not sampled from the
+  // host RT). Gate to the color resolve whose color base matches the recorded scene-color RT so the
+  // blend lands on the same surface this resolve dumps to guest RAM for the post/composite chain.
+  if (IsResolveOfRecordedSceneColor(resolve_info)) {
+    command_processor_.MaybeReprojectSunShadow();
+  }
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1817,9 +1829,18 @@ void VulkanRenderTargetCache::NoteSceneColorDepthRenderTargets() {
   }
   SunShadowFrameReset();
   RenderTarget* const* rts = last_update_accumulated_render_targets();
+  const uint32_t depth_width = rts[0] ? rts[0]->key().GetWidth() : 0u;
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
     RenderTarget* rt = rts[1 + i];
-    if (rt && rt->key().GetColorFormat() == xenos::ColorRenderTargetFormat::k_16_16_16_16) {
+    if (!rt) {
+      continue;
+    }
+    const xenos::ColorRenderTargetFormat fmt = rt->key().GetColorFormat();
+    // Must match the scene-color signature in ClassifyCurrentDrawForSunShadow exactly, or the
+    // reproject classifies the draw (cls==1) but never records the RT to sample/blend into: the
+    // gamma 8888 world target (+depth, full width) or a 64bpp HDR target.
+    if (xenos::IsColorRenderTargetFormat64bpp(fmt) ||
+        (fmt == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA && rts[0] && depth_width >= 1024)) {
       sun_shadow_scene_color_rt_ = rt;
       if (rts[0]) {
         sun_shadow_scene_depth_rt_ = rts[0];
@@ -1838,16 +1859,25 @@ int VulkanRenderTargetCache::ClassifyCurrentDrawForSunShadow() const {
   }
   RenderTarget* const* rts = last_update_accumulated_render_targets();
   bool any_color = false;
-  bool hdr_color = false;
+  bool scene_color = false;
+  // Width of the bound depth target (the world opaque pass always binds depth). Used to tell the
+  // full-res scene color pass apart from the half-res (~520-wide) SSAO/blur passes.
+  const uint32_t depth_width = rts[0] ? rts[0]->key().GetWidth() : 0u;
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
     RenderTarget* rt = rts[1 + i];
     if (!rt) {
       continue;
     }
     any_color = true;
-    // Main scene HDR target: any 64bpp color (k_16_16_16_16 or its FLOAT variant).
-    if (xenos::IsColorRenderTargetFormat64bpp(rt->key().GetColorFormat())) {
-      hdr_color = true;
+    const xenos::ColorRenderTargetFormat fmt = rt->key().GetColorFormat();
+    // Main scene color. RenderDoc shows the *resolve* target as 64bpp R16G16B16A16, but the IW4
+    // world opaque pass in this recomp actually renders to the gamma-encoded 8888 EDRAM target
+    // (k_8_8_8_8_GAMMA, base 98) at full scene width with depth bound -- NOT a 64bpp HDR target,
+    // which is why the original 64bpp check never matched (cls1 stayed 0). Match either: a 64bpp
+    // HDR color (in case some scenes use it) OR the gamma 8888 scene color + depth + full width.
+    if (xenos::IsColorRenderTargetFormat64bpp(fmt) ||
+        (fmt == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA && rts[0] && depth_width >= 1024)) {
+      scene_color = true;
     }
   }
 
@@ -1882,14 +1912,38 @@ int VulkanRenderTargetCache::ClassifyCurrentDrawForSunShadow() const {
     }
   }
 
-  if (hdr_color) {
-    return 1;  // main scene (HDR color bound)
+  if (scene_color) {
+    return 1;  // main scene (gamma 8888 / HDR color bound at full width with depth)
   }
-  // Depth-only into the narrow tall sun shadowmap atlas (width well under a scene target).
-  if (!any_color && rts[0] && rts[0]->key().GetWidth() <= 768) {
+  // Depth-only into the narrow tall sun shadowmap atlas (width well under a scene target). The IW4
+  // sun shadowmap (RenderDoc 19652, 560-wide D32S8, MSAA=1) is single-sampled; the other narrow
+  // depth passes in the frame (RenderDoc 16223/19664/20332, ~520/280-wide) are MSAA 4x, so gate on
+  // single-sample to avoid poisoning the captured sun VP with a spot/reflection-depth projection.
+  if (!any_color && rts[0] && rts[0]->key().GetWidth() <= 768 &&
+      rts[0]->key().msaa_samples == xenos::MsaaSamples::k1X) {
     return 2;
   }
   return 0;
+}
+
+bool VulkanRenderTargetCache::IsResolveOfRecordedSceneColor(
+    const draw_util::ResolveInfo& resolve_info) const {
+  if (GetPath() != Path::kHostRenderTargets || !sun_shadow_scene_color_rt_) {
+    return false;
+  }
+  // The reproject only makes sense at a COLOR resolve of the recorded scene-color RT: that resolve
+  // dumps this exact host RT to guest RAM, where the IW4 post/composite chain re-reads it (and the
+  // swap ultimately samples the composite). A depth resolve, or a color resolve of a different RT
+  // (SSAO/half-res/downsample), must not trigger it -- the blend would land on a surface this
+  // resolve doesn't propagate, and the once-per-frame guard would then skip the real scene resolve.
+  if (resolve_info.IsCopyingDepth()) {
+    return false;
+  }
+  // color_original_base == the RB color_base (the RT's EDRAM base, no packed-offset adjustment) ==
+  // RenderTargetKey::base_tiles, so this matches even a partial-rect resolve of the scene RT
+  // (color_edram_info.base_tiles adds the sub-region offset and would not match the RT key).
+  const uint32_t scene_color_base = sun_shadow_scene_color_rt_->key().base_tiles;
+  return resolve_info.color_original_base == scene_color_base;
 }
 
 bool VulkanRenderTargetCache::PrepareSunShadowReproject(SunShadowReprojectInputs& out) {

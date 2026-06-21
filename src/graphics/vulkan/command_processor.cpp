@@ -23,6 +23,7 @@
 
 #include <cstdio>          // [BO-SHOT] one-shot frontbuffer dump
 #include <atomic>
+#include <chrono>  // [A2] per-frame phase timing + upload-batching profiling
 #include <cmath>
 #include <filesystem>      // live-tune control-file mtime poll
 #include <rex/platform.h>  // REX_PLATFORM_WIN32 guards the POSIX-only SIGUSR1 fbdump trigger
@@ -37,6 +38,7 @@
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/shader.h>
@@ -174,11 +176,14 @@ REXCVAR_DEFINE_INT32(sun_shadow_scene_vp_reg, -1, "GPU/Vulkan",
 REXCVAR_DEFINE_INT32(sun_shadow_sun_vp_reg, -1, "GPU/Vulkan",
                      "Guest VS c# of the sun (shadowmap-build) view-proj matrix (-1 = auto-detect)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-// The captured matrices are row-major as stored in the constant buffer; GLSL reads a float[16] as
-// column-major, so the as-is upload is already the transpose the math needs. If the guest stores
-// them pre-transposed, flip this to correct the reprojection (tuned live via the heatmap). 0 = as
-// stored (default), 1 = transpose both matrices before use.
-REXCVAR_DEFINE_INT32(sun_shadow_transpose, 0, "GPU/Vulkan",
+// The captured c0-c3 block is row-major (guest stores clip = M * world, row per clip component).
+// GLSL reads a float[16] as column-major, so uploading the guest array as-is gives the shader M^T;
+// to get the wanted M * v the array must be transposed first. Offline RE on mw2_pit_dark.rdc
+// confirmed transpose=1: feeding the captured camera VP through the transpose path projects a known
+// scene point to NDC.xy ~= (0.96, -0.02) (on-screen), whereas transpose=0 sends it to NDC.y ~= 17
+// (off-screen) — so 1 is the correct default. Kept as a live knob in case a future capture stores
+// the matrices already transposed. 0 = upload as stored, 1 = transpose both before use.
+REXCVAR_DEFINE_INT32(sun_shadow_transpose, 1, "GPU/Vulkan",
                      "Transpose the captured sun-shadow matrices (0 = as stored, 1 = transpose)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 // Depth-compare direction (IW4 may use reverse-Z): a scene point is in shadow when its sun-space
@@ -360,6 +365,35 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// [A2] Cross-draw upload batching. When ON, each per-draw index/vertex RequestRange is recorded
+// into a frame-scoped batch as it happens, and at the START of the NEXT frame the union of those
+// ranges is replayed through a single SharedMemory::RequestRanges() call (which sorts+merges
+// internally). That coalesces the write-watch re-arm (mprotect-RO via MakeRangeValid ->
+// EnableAccessCallbacks) from ~hundreds of scattered per-draw runs into a handful of large
+// contiguous runs, collapsing the TLB-shootdown IPI storm that drives both the per-draw upload
+// tax and the busy-scene audio crunch.
+//
+// CORRECTNESS: this is a PREFETCH, not a deferral. The per-draw RequestRange calls are LEFT IN
+// PLACE and run exactly as before. The batch only WARMS residency up front using last frame's
+// range set (geometry is near-identical frame-to-frame at the heavy crew/3D views). If the
+// prefetch covered a range, the per-draw call early-outs (already valid) -> no per-draw mprotect.
+// If the prefetch missed a range (new geometry) or the guest invalidated it after the prefetch,
+// the per-draw call uploads + re-arms it normally. The write-watch is therefore never weakened:
+// nothing is skipped, every armed page is armed by the SAME MakeRangeValid path, just coalesced.
+// Default OFF (experimental). See docs/research/a2-upload-batching-plan.md.
+REXCVAR_DEFINE_BOOL(upload_batching, false, "GPU/Vulkan",
+                    "Prefetch last frame's per-draw index/vertex upload ranges as one coalesced "
+                    "RequestRanges at frame start, collapsing the write-watch re-arm mprotect "
+                    "storm at heavy skinned views (keeps the watch correct; per-draw requests "
+                    "remain as the fallback). Experimental.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace rex::graphics {
+// [A2] Defined in primitive_processor.cpp: per-frame index-buffer upload nanoseconds. IssueSwap
+// reads + zeroes it and folds it into the upload-time phase counter.
+extern int64_t g_a2_index_upload_ns;
+}  // namespace rex::graphics
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -385,6 +419,63 @@ BoFbdumpInstaller g_bo_fbdump_installer;
 // True while a one-shot dump is pending; forces the resolve→guest-RAM copy for that frame.
 inline bool bo_fbdump_pending() {
   return g_fbdump_request.load(std::memory_order_relaxed) > 0;
+}
+
+// [A2] Per-frame phase timing accumulators (nanoseconds, GPU command-processor thread only).
+// Summed across all IssueDraw calls in a frame, emitted once per frame in IssueSwap via the
+// PROFILE_* macros, then zeroed. These confirm where the ~65ms heavy-scene frame goes NOW.
+// Single-threaded GPU-thread access -> plain int64 is fine (no atomics needed).
+int64_t g_phase_upload_ns = 0;  // RequestRange(s) residency path (incl. write-watch re-arm).
+int64_t g_phase_emit_ns = 0;    // deferred command-buffer draw record.
+int64_t g_phase_issuedraw_other_ns = 0;  // remainder of IssueDraw.
+
+// IssueDraw sub-phase breakdown (nanoseconds, GPU command-processor thread only). These split the
+// "other" remainder into the dominant per-draw call sites. Summed across all IssueDraw calls in a
+// frame, emitted once per frame in IssueSwap, then zeroed. Together they should sum to ~=
+// g_phase_issuedraw_other_ns (a small residual stays in "other").
+int64_t g_phase_draw_shader_analysis_ns =
+    0;                                  // AnalyzeShaderUcode + shader modification/translation.
+int64_t g_phase_draw_sampler_ns = 0;    // GetSamplerParameters + UseSampler.
+int64_t g_phase_draw_texture_ns = 0;    // texture_cache_->RequestTextures.
+int64_t g_phase_draw_rt_update_ns = 0;  // render_target_cache_->Update.
+int64_t g_phase_draw_pipeline_ns = 0;   // ConfigurePipeline + GetPipelineAndLayoutByHandle.
+int64_t g_phase_draw_sys_const_ns = 0;  // UpdateSystemConstantValues.
+int64_t g_phase_draw_bindings_ns = 0;   // UpdateBindings.
+
+// Cheap RAII scoped accumulator: adds the scope's wall-clock duration to *sink_ns on destruct.
+class ScopedPhaseTimer {
+ public:
+  explicit ScopedPhaseTimer(int64_t* sink_ns)
+      : sink_ns_(sink_ns), start_(std::chrono::steady_clock::now()) {}
+  ~ScopedPhaseTimer() {
+    *sink_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - start_)
+                     .count();
+  }
+  ScopedPhaseTimer(const ScopedPhaseTimer&) = delete;
+  ScopedPhaseTimer& operator=(const ScopedPhaseTimer&) = delete;
+
+ private:
+  int64_t* sink_ns_;
+  std::chrono::steady_clock::time_point start_;
+};
+
+// [A2] Upload-batching collector. The two RequestRange call sites (the index path in
+// PrimitiveProcessor and the vertex/memexport paths in IssueDraw) record their (start,length)
+// into this frame-scoped vector while upload_batching is ON. At the start of the NEXT frame
+// (IssueSwap), the whole set is replayed once through SharedMemory::RequestRanges so the residency
+// re-arm coalesces. GPU command-processor thread only -> no synchronization needed.
+std::vector<std::pair<uint32_t, uint32_t>> g_upload_batch_recording;  // ranges seen this frame
+std::vector<std::pair<uint32_t, uint32_t>> g_upload_batch_prefetch;   // last frame's set, to replay
+bool g_upload_batch_active = false;  // cached cvar state for the current frame (set in IssueSwap)
+bool g_upload_batch_prefetch_pending = false;  // run the prefetch at the next frame's first draw
+
+// Called by the RequestRange call sites to record a range for next-frame prefetch (no-op unless
+// batching is active for this frame).
+inline void A2RecordUploadRange(uint32_t start, uint32_t length) {
+  if (g_upload_batch_active && length) {
+    g_upload_batch_recording.emplace_back(start, length);
+  }
 }
 
 // glslang default built-in resource limits.
@@ -920,6 +1011,14 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
 }
 
 }  // namespace
+
+// [A2] External-linkage hook so the index-buffer RequestRange site in primitive_processor.cpp
+// (a separate translation unit) can record its range into the same per-frame upload batch. The
+// collector state lives in the anonymous namespace above (internal linkage, still referenceable
+// here in the same TU). Forward-declared at the index call site.
+void A2RecordIndexUploadRange(uint32_t start, uint32_t length) {
+  A2RecordUploadRange(start, length);
+}
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -2730,6 +2829,49 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
+  // [A2] Frame boundary. (1) Emit the per-frame phase-timing counters (microseconds) so the
+  // CPU-bound IssueDraw split is visible via the F3/CSV harness, then reset the ns accumulators.
+  // (2) Rotate the upload batch: this frame's recorded ranges become next frame's prefetch set,
+  // and we arm the prefetch to run at the next frame's first IssueDraw (inside that submission,
+  // before any draw consumes the data — see the prefetch block in IssueDraw).
+  {
+    PROFILE_UPLOAD_TIME_US((g_phase_upload_ns + rex::graphics::g_a2_index_upload_ns) / 1000);
+    PROFILE_EMIT_TIME_US(g_phase_emit_ns / 1000);
+    PROFILE_ISSUE_DRAW_OTHER_US(g_phase_issuedraw_other_ns / 1000);
+    PROFILE_DRAW_SHADER_ANALYSIS_US(g_phase_draw_shader_analysis_ns / 1000);
+    PROFILE_DRAW_SAMPLER_US(g_phase_draw_sampler_ns / 1000);
+    PROFILE_DRAW_TEXTURE_US(g_phase_draw_texture_ns / 1000);
+    PROFILE_DRAW_RT_UPDATE_US(g_phase_draw_rt_update_ns / 1000);
+    PROFILE_DRAW_PIPELINE_US(g_phase_draw_pipeline_ns / 1000);
+    PROFILE_DRAW_SYS_CONST_US(g_phase_draw_sys_const_ns / 1000);
+    PROFILE_DRAW_BINDINGS_US(g_phase_draw_bindings_ns / 1000);
+    g_phase_upload_ns = 0;
+    rex::graphics::g_a2_index_upload_ns = 0;
+    g_phase_emit_ns = 0;
+    g_phase_issuedraw_other_ns = 0;
+    g_phase_draw_shader_analysis_ns = 0;
+    g_phase_draw_sampler_ns = 0;
+    g_phase_draw_texture_ns = 0;
+    g_phase_draw_rt_update_ns = 0;
+    g_phase_draw_pipeline_ns = 0;
+    g_phase_draw_sys_const_ns = 0;
+    g_phase_draw_bindings_ns = 0;
+
+    bool batching = REXCVAR_GET(upload_batching);
+    g_upload_batch_active = batching;
+    if (batching) {
+      // Promote this frame's recording to the prefetch set; arm it for next frame's first draw.
+      g_upload_batch_prefetch.swap(g_upload_batch_recording);
+      g_upload_batch_recording.clear();
+      g_upload_batch_prefetch_pending = !g_upload_batch_prefetch.empty();
+    } else {
+      // Cvar turned off live: drop any pending state so we cleanly fall back to per-draw requests.
+      g_upload_batch_recording.clear();
+      g_upload_batch_prefetch.clear();
+      g_upload_batch_prefetch_pending = false;
+    }
+  }
+
   MaybeApplyLiveTune();
 
   // Force a gamma-ramp re-upload when a display-grade cvar changes (via the F4 overlay or the
@@ -4174,6 +4316,29 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   g_fbdump_draws.fetch_add(1, std::memory_order_relaxed);  // [BO-SHOT] per-swap draw count
 
+  // [A2] Phase timing: time the whole IssueDraw, snapshot the upload/emit/index accumulators at
+  // entry, and on exit attribute (total - upload-delta - emit-delta) to "other IssueDraw". The
+  // upload-delta includes both this draw's vertex/memexport RequestRange (g_phase_upload_ns) AND
+  // the index RequestRange that ran inside primitive_processor_->Process (g_a2_index_upload_ns).
+  struct IssueDrawPhaseTimer {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    int64_t upload_at_entry = g_phase_upload_ns;
+    int64_t index_at_entry = rex::graphics::g_a2_index_upload_ns;
+    int64_t emit_at_entry = g_phase_emit_ns;
+    ~IssueDrawPhaseTimer() {
+      int64_t total = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+      int64_t upload_delta = (g_phase_upload_ns - upload_at_entry) +
+                             (rex::graphics::g_a2_index_upload_ns - index_at_entry);
+      int64_t emit_delta = g_phase_emit_ns - emit_at_entry;
+      int64_t other = total - upload_delta - emit_delta;
+      if (other > 0) {
+        g_phase_issuedraw_other_ns += other;
+      }
+    }
+  } a2_phase_timer;
+
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
   auto draw_fail = [&](const char* stage) {
@@ -4208,7 +4373,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // Always need a vertex shader.
     return draw_fail("missing_vertex_shader");
   }
-  pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  {
+    ScopedPhaseTimer t(&g_phase_draw_shader_analysis_ns);
+    pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  }
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
   if (memexport_used_vertex) {
     if (!device_properties.vertexPipelineStoresAndAtomics) {
@@ -4235,7 +4403,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (edram_mode == xenos::EdramMode::kColorDepth) {
       pixel_shader = static_cast<VulkanShader*>(active_pixel_shader());
       if (pixel_shader) {
-        pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
+        {
+          ScopedPhaseTimer t(&g_phase_draw_shader_analysis_ns);
+          pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
+        }
         if (!draw_util::IsPixelShaderNeededWithRasterization(*pixel_shader, regs)) {
           pixel_shader = nullptr;
         }
@@ -4287,6 +4458,23 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return draw_fail("begin_submission");
     }
 
+    // [A2] First draw of the frame (a submission is now active): replay last frame's union of
+    // index/vertex upload ranges as ONE coalesced RequestRanges. RequestRanges sorts + merges
+    // adjacent ranges, so the write-watch re-arm (MakeRangeValid -> EnableAccessCallbacks ->
+    // mprotect) collapses from hundreds of scattered per-draw runs into a handful of large
+    // contiguous runs. The upload copies are recorded into THIS submission's deferred command
+    // buffer with the kTransferDestination barrier (same path as a normal per-draw request), so
+    // residency is ordered before the consuming draws. This is a PREFETCH: the per-draw
+    // RequestRange calls below remain and re-upload anything the prefetch missed or that the guest
+    // invalidates afterward -> the watch stays correct, nothing is skipped. Runs once per frame.
+    if (g_upload_batch_prefetch_pending) {
+      g_upload_batch_prefetch_pending = false;
+      ScopedPhaseTimer a2_prefetch_timer(&g_phase_upload_ns);
+      // Ignore the bool result: a failure here is non-fatal (the per-draw requests are the
+      // authoritative residency path); RequestRanges only returns false on a malformed range.
+      shared_memory_->RequestRanges(g_upload_batch_prefetch.data(), g_upload_batch_prefetch.size());
+    }
+
     // Process primitives.
     if (!primitive_processor_->Process(primitive_processing_result)) {
       return draw_fail("primitive_processing");
@@ -4318,21 +4506,24 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
 
     // Shader modifications.
-    vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
-        *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
-        ps_param_gen_pos != UINT32_MAX);
-    pixel_shader_modification = pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
-                                                   *pixel_shader, interpolator_mask,
-                                                   ps_param_gen_pos, normalized_depth_control)
-                                             : SpirvShaderTranslator::Modification(0);
+    {
+      ScopedPhaseTimer t(&g_phase_draw_shader_analysis_ns);
+      vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
+          *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
+          ps_param_gen_pos != UINT32_MAX);
+      pixel_shader_modification = pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
+                                                     *pixel_shader, interpolator_mask,
+                                                     ps_param_gen_pos, normalized_depth_control)
+                                               : SpirvShaderTranslator::Modification(0);
 
-    // Translate the shaders now to obtain the sampler bindings.
-    vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
-        vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
-    pixel_shader_translation =
-        pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
-                           pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
-                     : nullptr;
+      // Translate the shaders now to obtain the sampler bindings.
+      vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
+          vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
+      pixel_shader_translation =
+          pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
+                             pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
+                       : nullptr;
+    }
     if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
                                                   pixel_shader_translation)) {
       return draw_fail("shader_translation");
@@ -4346,46 +4537,52 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // TODO(Triang3l): Sampler caching and reuse for adjacent draws within one
     // submission.
     uint32_t samplers_overflowed_count = 0;
-    for (uint32_t j = 0; j < 2; ++j) {
-      std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
-          j ? current_samplers_pixel_ : current_samplers_vertex_;
-      if (!i) {
-        shader_samplers.clear();
-      }
-      const VulkanShader* shader = j ? pixel_shader : vertex_shader;
-      if (!shader) {
-        continue;
-      }
-      const std::vector<VulkanShader::SamplerBinding>& shader_sampler_bindings =
-          shader->GetSamplerBindingsAfterTranslation();
-      if (!i) {
-        shader_samplers.reserve(shader_sampler_bindings.size());
-        for (const VulkanShader::SamplerBinding& shader_sampler_binding : shader_sampler_bindings) {
-          shader_samplers.emplace_back(texture_cache_->GetSamplerParameters(shader_sampler_binding),
-                                       VK_NULL_HANDLE);
+    // Time the per-draw sampler acquisition (GetSamplerParameters + UseSampler). Scoped to this
+    // block so the rare sampler-overflow await below is not counted.
+    {
+      ScopedPhaseTimer sampler_phase_timer(&g_phase_draw_sampler_ns);
+      for (uint32_t j = 0; j < 2; ++j) {
+        std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
+            j ? current_samplers_pixel_ : current_samplers_vertex_;
+        if (!i) {
+          shader_samplers.clear();
         }
-      }
-      for (std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& shader_sampler_pair :
-           shader_samplers) {
-        // UseSampler calls are needed even on the second iteration in case the
-        // submission was broken (and thus the last usage submission indices for
-        // the used samplers need to be updated) due to an overflow within one
-        // submission. Though sampler overflow is a very rare situation overall.
-        bool sampler_overflowed;
-        VkSampler shader_sampler =
-            texture_cache_->UseSampler(shader_sampler_pair.first, sampler_overflowed);
-        shader_sampler_pair.second = shader_sampler;
-        if (shader_sampler == VK_NULL_HANDLE) {
-          if (!sampler_overflowed || i) {
-            // If !sampler_overflowed, just failed to create a sampler for some
-            // reason.
-            // If i == 1, an overflow has happened twice, can't recover from it
-            // anymore (would enter an infinite loop otherwise if the number of
-            // attempts was not limited to 2). Possibly too many unique samplers
-            // in one draw, or failed to await submission completion.
-            return draw_fail("sampler_acquisition");
+        const VulkanShader* shader = j ? pixel_shader : vertex_shader;
+        if (!shader) {
+          continue;
+        }
+        const std::vector<VulkanShader::SamplerBinding>& shader_sampler_bindings =
+            shader->GetSamplerBindingsAfterTranslation();
+        if (!i) {
+          shader_samplers.reserve(shader_sampler_bindings.size());
+          for (const VulkanShader::SamplerBinding& shader_sampler_binding :
+               shader_sampler_bindings) {
+            shader_samplers.emplace_back(
+                texture_cache_->GetSamplerParameters(shader_sampler_binding), VK_NULL_HANDLE);
           }
-          ++samplers_overflowed_count;
+        }
+        for (std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& shader_sampler_pair :
+             shader_samplers) {
+          // UseSampler calls are needed even on the second iteration in case the
+          // submission was broken (and thus the last usage submission indices for
+          // the used samplers need to be updated) due to an overflow within one
+          // submission. Though sampler overflow is a very rare situation overall.
+          bool sampler_overflowed;
+          VkSampler shader_sampler =
+              texture_cache_->UseSampler(shader_sampler_pair.first, sampler_overflowed);
+          shader_sampler_pair.second = shader_sampler;
+          if (shader_sampler == VK_NULL_HANDLE) {
+            if (!sampler_overflowed || i) {
+              // If !sampler_overflowed, just failed to create a sampler for some
+              // reason.
+              // If i == 1, an overflow has happened twice, can't recover from it
+              // anymore (would enter an infinite loop otherwise if the number of
+              // attempts was not limited to 2). Possibly too many unique samplers
+              // in one draw, or failed to await submission completion.
+              return draw_fail("sampler_acquisition");
+            }
+            ++samplers_overflowed_count;
+          }
         }
       }
     }
@@ -4415,12 +4612,20 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
-  texture_cache_->RequestTextures(used_texture_mask);
+  {
+    ScopedPhaseTimer t(&g_phase_draw_texture_ns);
+    texture_cache_->RequestTextures(used_texture_mask);
+  }
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
-                                    normalized_color_mask, *vertex_shader)) {
+  bool rt_update_ok;
+  {
+    ScopedPhaseTimer t(&g_phase_draw_rt_update_ns);
+    rt_update_ok = render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                                normalized_color_mask, *vertex_shader);
+  }
+  if (!rt_update_ok) {
     return draw_fail("render_target_update");
   }
 
@@ -4429,18 +4634,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // textures.
   VkPipeline pipeline;
   void* pipeline_handle = nullptr;
-  if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
-                                          primitive_processing_result, normalized_depth_control,
-                                          normalized_color_mask,
-                                          render_target_cache_->last_update_render_pass_key(),
-                                          pipeline, pipeline_layout_provider, &pipeline_handle)) {
-    return draw_fail("configure_pipeline");
-  }
   bool pipeline_is_placeholder = false;
-  // Reload the current handle state to observe async hot-swap completions that
-  // may happen between pipeline configuration and binding.
-  pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
-                                                &pipeline_is_placeholder);
+  {
+    ScopedPhaseTimer t(&g_phase_draw_pipeline_ns);
+    if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
+                                            primitive_processing_result, normalized_depth_control,
+                                            normalized_color_mask,
+                                            render_target_cache_->last_update_render_pass_key(),
+                                            pipeline, pipeline_layout_provider, &pipeline_handle)) {
+      return draw_fail("configure_pipeline");
+    }
+    // Reload the current handle state to observe async hot-swap completions that
+    // may happen between pipeline configuration and binding.
+    pipeline_cache_->GetPipelineAndLayoutByHandle(
+        pipeline_handle, pipeline, pipeline_layout_provider, &pipeline_is_placeholder);
+  }
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
     frame_used_async_placeholder_pipeline_ = true;
     return true;
@@ -4547,13 +4755,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   // Update system constants before uploading them.
-  UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
-                             shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
-                             normalized_depth_control, normalized_color_mask);
+  {
+    ScopedPhaseTimer t(&g_phase_draw_sys_const_ns);
+    UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
+                               shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
+                               normalized_depth_control, normalized_color_mask);
+  }
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
-  if (!UpdateBindings(vertex_shader, pixel_shader)) {
+  bool update_bindings_ok;
+  {
+    ScopedPhaseTimer t(&g_phase_draw_bindings_ns);
+    update_bindings_ok = UpdateBindings(vertex_shader, pixel_shader);
+  }
+  if (!update_bindings_ok) {
     return draw_fail("update_bindings");
   }
 
@@ -4594,12 +4810,20 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
-        REXGPU_ERROR(
-            "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
-            "memory",
-            vfetch_constant.address << 2, vfetch_constant.size << 2);
-        return false;
+      // [A2] Record + time the vertex-buffer residency request (upload-time phase counter; range
+      // recorded for next-frame prefetch coalescing when upload_batching is ON).
+      {
+        uint32_t vb_start = vfetch_constant.address << 2;
+        uint32_t vb_len = vfetch_constant.size << 2;
+        A2RecordUploadRange(vb_start, vb_len);
+        ScopedPhaseTimer a2_vb_timer(&g_phase_upload_ns);
+        if (!shared_memory_->RequestRange(vb_start, vb_len)) {
+          REXGPU_ERROR(
+              "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
+              "memory",
+              vb_start, vb_len);
+          return false;
+        }
       }
       state.address = vfetch_constant.address;
       state.size = vfetch_constant.size;
@@ -4612,7 +4836,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t memexport_extent_start = UINT32_MAX, memexport_extent_end = 0;
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
     uint32_t memexport_range_base_bytes = memexport_range.base_address_dwords << 2;
-    if (!shared_memory_->RequestRange(memexport_range_base_bytes, memexport_range.size_bytes)) {
+    // [A2] Time only (upload-time phase). Do NOT record memexport ranges for prefetch batching:
+    // they are GPU-WRITTEN destinations (RangeWrittenByGpu below), not CPU-upload geometry, and
+    // prefetching them would be wrong (the watch/written-by-gpu semantics must be preserved).
+    bool a2_memexport_ok;
+    {
+      ScopedPhaseTimer a2_mx_timer(&g_phase_upload_ns);
+      a2_memexport_ok =
+          shared_memory_->RequestRange(memexport_range_base_bytes, memexport_range.size_bytes);
+    }
+    if (!a2_memexport_ok) {
       REXGPU_ERROR(
           "Failed to request memexport stream at 0x{:08X} (size {}) in the "
           "shared memory",
@@ -4624,7 +4857,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         std::max(memexport_extent_end, memexport_range_base_bytes + memexport_range.size_bytes);
   }
   if (memexport_writes_possible && memexport_ranges_.empty()) {
-    if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
+    // [A2] Time only (full-buffer conservative residency for unknown memexport dests; not
+    // recorded for prefetch — GPU-written / conservative path).
+    bool a2_full_ok;
+    {
+      ScopedPhaseTimer a2_full_timer(&g_phase_upload_ns);
+      a2_full_ok = shared_memory_->RequestRange(0, SharedMemory::kBufferSize);
+    }
+    if (!a2_full_ok) {
       REXGPU_ERROR(
           "Failed to request full shared memory residency for unresolved "
           "memexport destinations");
@@ -4696,42 +4936,53 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       render_target_cache_->last_update_framebuffer());
 
   // Draw.
-  if (primitive_processing_result.index_buffer_type ==
-          PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
-      shader_32bit_index_dma) {
-    deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
-  } else {
-    std::pair<VkBuffer, VkDeviceSize> index_buffer;
-    switch (primitive_processing_result.index_buffer_type) {
-      case PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA:
-        if (guest_dma_index_scratch_buffer.buffer() != VK_NULL_HANDLE) {
-          index_buffer.first = guest_dma_index_scratch_buffer.buffer();
-          index_buffer.second = 0;
-        } else {
-          index_buffer.first = shared_memory_->buffer();
-          index_buffer.second = primitive_processing_result.guest_index_base;
-        }
-        break;
-      case PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted:
-        index_buffer = primitive_processor_->GetConvertedIndexBuffer(
-            primitive_processing_result.host_index_buffer_handle);
-        break;
-      case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForAuto:
-      case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA:
-        index_buffer = primitive_processor_->GetBuiltinIndexBuffer(
-            primitive_processing_result.host_index_buffer_handle);
-        break;
-      default:
-        assert_unhandled_case(primitive_processing_result.index_buffer_type);
-        return draw_fail("unexpected_index_buffer_type");
+  {
+    // [A2] Emit-time phase counter: the deferred command-buffer draw record
+    // (CmdVkBindIndexBuffer + CmdVkDraw / CmdVkDrawIndexed). Tightly scoped to this block so the
+    // post-draw memexport invalidation/readback work is NOT counted as emit.
+    ScopedPhaseTimer a2_emit_timer(&g_phase_emit_ns);
+    if (primitive_processing_result.index_buffer_type ==
+            PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+        shader_32bit_index_dma) {
+      PROFILE_DRAW_CALL();
+      PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+      deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0,
+                                         0);
+    } else {
+      std::pair<VkBuffer, VkDeviceSize> index_buffer;
+      switch (primitive_processing_result.index_buffer_type) {
+        case PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA:
+          if (guest_dma_index_scratch_buffer.buffer() != VK_NULL_HANDLE) {
+            index_buffer.first = guest_dma_index_scratch_buffer.buffer();
+            index_buffer.second = 0;
+          } else {
+            index_buffer.first = shared_memory_->buffer();
+            index_buffer.second = primitive_processing_result.guest_index_base;
+          }
+          break;
+        case PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted:
+          index_buffer = primitive_processor_->GetConvertedIndexBuffer(
+              primitive_processing_result.host_index_buffer_handle);
+          break;
+        case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForAuto:
+        case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA:
+          index_buffer = primitive_processor_->GetBuiltinIndexBuffer(
+              primitive_processing_result.host_index_buffer_handle);
+          break;
+        default:
+          assert_unhandled_case(primitive_processing_result.index_buffer_type);
+          return draw_fail("unexpected_index_buffer_type");
+      }
+      deferred_command_buffer_.CmdVkBindIndexBuffer(
+          index_buffer.first, index_buffer.second,
+          primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
+              ? VK_INDEX_TYPE_UINT16
+              : VK_INDEX_TYPE_UINT32);
+      PROFILE_DRAW_CALL();
+      PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+      deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count,
+                                                1, 0, 0, 0);
     }
-    deferred_command_buffer_.CmdVkBindIndexBuffer(
-        index_buffer.first, index_buffer.second,
-        primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
-            ? VK_INDEX_TYPE_UINT16
-            : VK_INDEX_TYPE_UINT32);
-    deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
-                                              0, 0, 0);
   }
 
   // Invalidate textures in memexported memory and watch for changes.
@@ -5822,6 +6073,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
+    PROFILE_CMD_BUFFER_STALL();
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
@@ -7258,32 +7510,95 @@ void VulkanCommandProcessor::CaptureSunShadowMatrices(const VulkanShader* vertex
                   sizeof(float) * 4);
     }
   };
+  // Offline RenderDoc RE (mw2_pit_dark.rdc) proved both the camera VP (world draws into the 64bpp
+  // HDR RT 20389) AND the sun VP (depth-only build into the 560-wide single-sample atlas 19652) sit
+  // at c0-c3, row-major, and are CONSTANT across all draws of their pass (c4-c7 are the per-object
+  // world matrix). But the Xenia VS float-usage bitmap does not reliably flag c0 as "used" on these
+  // draws (confirmed live: reg_used(0)=0 on the shadow-build draws), so gating capture on reg_used
+  // alone silently drops the matrix. Instead accept when the c0-c3 block is a plausible projection:
+  // not all-zero, not the identity, finite and bounded. Keep reg_used as a fast-accept hint.
+  auto block_is_matrix = [&](uint32_t base) -> bool {
+    float m[16];
+    read_block(base, m);
+    float maxabs = 0.0f;
+    int nonzero = 0;
+    bool finite = true;
+    for (int i = 0; i < 16; ++i) {
+      const float v = m[i];
+      if (!std::isfinite(v)) {
+        finite = false;
+      }
+      const float a = std::fabs(v);
+      if (a > 1e-6f) {
+        ++nonzero;
+      }
+      if (a > maxabs) {
+        maxabs = a;
+      }
+    }
+    if (!finite || nonzero < 4 || maxabs > 1e7f) {
+      return false;
+    }
+    // Reject an exact identity (an unset/identity world block, not a projection).
+    bool is_identity = true;
+    for (int r = 0; r < 4 && is_identity; ++r) {
+      for (int c = 0; c < 4; ++c) {
+        const float expect = (r == c) ? 1.0f : 0.0f;
+        if (std::fabs(m[r * 4 + c] - expect) > 1e-4f) {
+          is_identity = false;
+          break;
+        }
+      }
+    }
+    return !is_identity;
+  };
   const int32_t scene_reg_override = REXCVAR_GET(sun_shadow_scene_vp_reg);
   const int32_t sun_reg_override = REXCVAR_GET(sun_shadow_sun_vp_reg);
   const uint32_t scene_reg = scene_reg_override >= 0 ? uint32_t(scene_reg_override) : 0;
   const uint32_t sun_reg = sun_reg_override >= 0 ? uint32_t(sun_reg_override) : 0;
 
-  if (cls == 1 && !sun_shadow_scene_vp_valid_ && reg_used(scene_reg)) {
+  if (cls == 1 && !sun_shadow_scene_vp_valid_ &&
+      (reg_used(scene_reg) || block_is_matrix(scene_reg))) {
     read_block(scene_reg, sun_shadow_scene_vp_);
     sun_shadow_scene_vp_valid_ = true;
-  } else if (cls == 2 && !sun_shadow_sun_vp_valid_ && reg_used(sun_reg)) {
+  } else if (cls == 2 && !sun_shadow_sun_vp_valid_ &&
+             (reg_used(sun_reg) || block_is_matrix(sun_reg))) {
     read_block(sun_reg, sun_shadow_sun_vp_);
     sun_shadow_sun_vp_valid_ = true;
   }
 
-  // Continuous heartbeat (sun_shadow_debug): once per ~300-frame window on a scene/sun draw, record
-  // whether each side is firing in-game (the per-epoch matrix dump alone only sampled boot).
+  // Continuous heartbeat (sun_shadow_debug): accumulate per-~300-frame-window COUNTS of cls=1
+  // (scene) vs cls=2 (sun) draws and flush at the window boundary. Counting (not a single boundary
+  // sample) avoids the artifact that made the prior live session conclude "cls always 2": a single
+  // sampled draw at the window edge is biased; the counts show both passes really occur in-game.
   if (REXCVAR_GET(sun_shadow_debug)) {
     static uint64_t hb_window = ~0ull;
+    static uint32_t hb_scene = 0, hb_sun = 0, hb_scene_match = 0, hb_sun_match = 0;
     const uint64_t w = frame_current_ / 300;
     if (w != hb_window) {
+      if (hb_window != ~0ull) {
+        if (std::FILE* f = std::fopen("/tmp/mw2_sunshadow.txt", "a")) {
+          std::fprintf(f,
+                       "HB f=%llu cls1(scene)=%u cls2(sun)=%u scene_block_ok=%u sun_block_ok=%u "
+                       "scene_valid=%d sun_valid=%d\n",
+                       static_cast<unsigned long long>(frame_current_), hb_scene, hb_sun,
+                       hb_scene_match, hb_sun_match, int(sun_shadow_scene_vp_valid_),
+                       int(sun_shadow_sun_vp_valid_));
+          std::fclose(f);
+        }
+      }
       hb_window = w;
-      if (std::FILE* f = std::fopen("/tmp/mw2_sunshadow.txt", "a")) {
-        std::fprintf(f, "HB f=%llu cls=%d scene_valid=%d sun_valid=%d reg_used(%u)=%d\n",
-                     static_cast<unsigned long long>(frame_current_), cls,
-                     int(sun_shadow_scene_vp_valid_), int(sun_shadow_sun_vp_valid_),
-                     cls == 2 ? sun_reg : scene_reg, int(reg_used(cls == 2 ? sun_reg : scene_reg)));
-        std::fclose(f);
+      hb_scene = hb_sun = hb_scene_match = hb_sun_match = 0;
+    }
+    if (cls == 1) {
+      ++hb_scene;
+      if (reg_used(scene_reg) || block_is_matrix(scene_reg)) {
+        ++hb_scene_match;
+      }
+    } else if (cls == 2) {
+      ++hb_sun;
+      if (reg_used(sun_reg) || block_is_matrix(sun_reg)) {
+        ++hb_sun_match;
       }
     }
   }

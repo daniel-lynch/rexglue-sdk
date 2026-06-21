@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>  // [A2] index-upload phase timing
 #include <cstring>
 #include <functional>
 #include <utility>
@@ -85,6 +86,19 @@ REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, 0, "GPU",
 //     "GPU");
 
 namespace rex::graphics {
+
+// [A2] Defined in vulkan/command_processor.cpp (always linked into rexgraphics here). Records the
+// index-buffer upload range into the per-frame batch so it can be prefetched (coalesced) at the
+// start of the next frame. No-op unless the upload_batching cvar is ON. Also wraps the index
+// RequestRange in the upload-time phase counter via g_a2_index_upload_ns (extern below).
+namespace vulkan {
+void A2RecordIndexUploadRange(uint32_t start, uint32_t length);
+}  // namespace vulkan
+
+// [A2] Per-frame index-upload nanoseconds. Accumulated here (the index RequestRange site) and
+// folded into the upload-time phase counter by the Vulkan command processor in IssueSwap, which
+// reads + zeroes it. GPU command-processor thread only -> plain int64.
+int64_t g_a2_index_upload_ns = 0;
 
 // SIMD processing here assumes that alignment is not required (neither AVX nor
 // Neon requires it) and there's no punishment for using an unaligned access
@@ -923,7 +937,15 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       cacheable.index_buffer_type == ProcessedIndexBufferType::kHostBuiltinForDMA) {
     // Request the index buffer memory.
     // TODO(Triang3l): Shared memory request cache.
-    if (!shared_memory_.RequestRange(guest_index_base, guest_index_buffer_needed_bytes)) {
+    // [A2] Record the range for next-frame prefetch coalescing (no-op unless upload_batching is
+    // ON) and time the upload (folded into the upload-time phase counter by IssueSwap).
+    vulkan::A2RecordIndexUploadRange(guest_index_base, guest_index_buffer_needed_bytes);
+    auto a2_idx_start = std::chrono::steady_clock::now();
+    bool a2_idx_ok = shared_memory_.RequestRange(guest_index_base, guest_index_buffer_needed_bytes);
+    g_a2_index_upload_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - a2_idx_start)
+                                .count();
+    if (!a2_idx_ok) {
       REXGPU_ERROR(
           "PrimitiveProcessor: Failed to request index buffer 0x{:08X}, 0x{:X} "
           "bytes needed, in the shared memory",

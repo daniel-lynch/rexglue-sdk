@@ -29,6 +29,26 @@ enum class CounterId : uint16_t {
   kCommandBufferStalls,
   kVerticesProcessed,
 
+  // GPU per-frame phase timing (microseconds, accumulated per frame).
+  // Splits the CPU-bound IssueDraw cost so the per-draw upload tax is measurable
+  // via the F3/CSV harness (see ingame-fps-crew-resume.md / a2-upload-batching-plan.md).
+  kUploadTimeUs,      // RequestRange/RequestRanges path (index + vertex + memexport),
+                      // including the write-watch re-arm (MakeRangeValid -> EnableAccessCallbacks).
+  kEmitTimeUs,        // deferred command-buffer draw record (CmdVkBindIndexBuffer + CmdVkDraw*).
+  kIssueDrawOtherUs,  // remainder of IssueDraw (shader analysis, bindings, RT/pipeline, glue).
+
+  // GPU IssueDraw sub-phase breakdown (microseconds, accumulated per frame). These split the
+  // "issue_draw_other_us" remainder into the dominant per-draw call sites so the heavy-scene
+  // hotspot is measurable. Together they should sum to ~= issue_draw_other_us (a small residual
+  // — viewport/barriers/renderpass glue — stays in "other").
+  kDrawShaderAnalysisUs,  // AnalyzeShaderUcode (VS+PS) + shader modification/translation lookup.
+  kDrawSamplerUs,         // GetSamplerParameters + UseSampler (per-draw sampler acquisition).
+  kDrawTextureUs,         // texture_cache_->RequestTextures.
+  kDrawRtUpdateUs,        // render_target_cache_->Update (RT/EDRAM ownership).
+  kDrawPipelineUs,        // pipeline_cache_->ConfigurePipeline + GetPipelineAndLayoutByHandle.
+  kDrawSysConstUs,        // UpdateSystemConstantValues.
+  kDrawBindingsUs,        // UpdateBindings (descriptor set build).
+
   // Audio
   kXmaFramesDecoded,
   kAudioFrameLatencyUs,
@@ -147,6 +167,16 @@ class Profiler {
 #define PROFILE_DRAW_CALL() PERF_counter_inc(kDrawCalls)
 #define PROFILE_VERTICES(n) PERF_counter_add(kVerticesProcessed, n)
 #define PROFILE_CMD_BUFFER_STALL() PERF_counter_inc(kCommandBufferStalls)
+#define PROFILE_UPLOAD_TIME_US(value) PERF_counter_set(kUploadTimeUs, value)
+#define PROFILE_EMIT_TIME_US(value) PERF_counter_set(kEmitTimeUs, value)
+#define PROFILE_ISSUE_DRAW_OTHER_US(value) PERF_counter_set(kIssueDrawOtherUs, value)
+#define PROFILE_DRAW_SHADER_ANALYSIS_US(value) PERF_counter_set(kDrawShaderAnalysisUs, value)
+#define PROFILE_DRAW_SAMPLER_US(value) PERF_counter_set(kDrawSamplerUs, value)
+#define PROFILE_DRAW_TEXTURE_US(value) PERF_counter_set(kDrawTextureUs, value)
+#define PROFILE_DRAW_RT_UPDATE_US(value) PERF_counter_set(kDrawRtUpdateUs, value)
+#define PROFILE_DRAW_PIPELINE_US(value) PERF_counter_set(kDrawPipelineUs, value)
+#define PROFILE_DRAW_SYS_CONST_US(value) PERF_counter_set(kDrawSysConstUs, value)
+#define PROFILE_DRAW_BINDINGS_US(value) PERF_counter_set(kDrawBindingsUs, value)
 #define PROFILE_AUDIO_LATENCY_US(value) PERF_counter_set(kAudioFrameLatencyUs, value)
 #define PROFILE_BUFFER_QUEUE_DEPTH(value) PERF_counter_set(kBufferQueueDepth, value)
 #define PROFILE_THREAD_CREATED() PERF_counter_inc(kActiveThreads)
@@ -172,6 +202,16 @@ class Profiler {
 #define PROFILE_DRAW_CALL()
 #define PROFILE_VERTICES(n)
 #define PROFILE_CMD_BUFFER_STALL()
+#define PROFILE_UPLOAD_TIME_US(value)
+#define PROFILE_EMIT_TIME_US(value)
+#define PROFILE_ISSUE_DRAW_OTHER_US(value)
+#define PROFILE_DRAW_SHADER_ANALYSIS_US(value)
+#define PROFILE_DRAW_SAMPLER_US(value)
+#define PROFILE_DRAW_TEXTURE_US(value)
+#define PROFILE_DRAW_RT_UPDATE_US(value)
+#define PROFILE_DRAW_PIPELINE_US(value)
+#define PROFILE_DRAW_SYS_CONST_US(value)
+#define PROFILE_DRAW_BINDINGS_US(value)
 #define PROFILE_AUDIO_LATENCY_US(value)
 #define PROFILE_BUFFER_QUEUE_DEPTH(value)
 #define PROFILE_THREAD_CREATED()
