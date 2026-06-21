@@ -8230,8 +8230,18 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
             const float* src = reinterpret_cast<const float*>(
                 &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)]);
             float* dst = reinterpret_cast<float*>(mapping);
+            // Fingerprint tolerance was 0.01 — far too loose. That ±0.01 band [1.4327,1.4527]
+            // also catches world/view/projection and bone-matrix elements, which sweep through it
+            // as the camera/skeleton rotates; scaling them by kFogDensityScale balloons skinned
+            // geometry at certain view angles (the humvee minigun "goes wide" warp). The genuine
+            // fog coefficient is the baked log2(e) literal (the exp->exp2 fog-coord conversion),
+            // which a shader compiler emits bit-exact (0x3FB8AA3B); a transform-matrix element
+            // only lands this close transiently. Tighten so only the literal matches: a matrix
+            // element would have to SIT within 1e-4 of log2(e) at a held angle, which is
+            // measure-zero, while the literal matches with ~1e-7 to spare.
+            constexpr float kLog2E = 1.4426950408889634f;
             for (int k = 0; k < 4; ++k) {
-              if (std::fabs(src[k] - 1.442695f) < 0.01f) {
+              if (std::fabs(src[k] - kLog2E) < 1e-4f) {
                 dst[k] = src[k] * kFogDensityScale;
               }
             }
