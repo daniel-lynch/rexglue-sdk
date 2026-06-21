@@ -7717,6 +7717,8 @@ void main() {
 // Reconstruct world pos from the (multisampled) scene depth, project into the captured sun view-proj,
 // compare against the sun shadowmap, and output a multiply factor (debug => raw visibility).
 const char* kSunShadowFsSource = R"(#version 450
+// texelFetch on a sampler-less texture2DMS / texture2D requires this extension under Vulkan GLSL.
+#extension GL_EXT_samplerless_texture_functions : require
 layout(location = 0) in vec2 xe_uv;
 layout(location = 0) out vec4 xe_out;
 layout(set = 0, binding = 0) uniform texture2DMS xe_scene_depth;
