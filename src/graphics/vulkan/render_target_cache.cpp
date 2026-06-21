@@ -1727,6 +1727,35 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
             rt_dst_access_mask, vulkan_rt.current_layout(), rt_new_layout);
         vulkan_rt.SetUsage(rt_dst_stage_mask, rt_dst_access_mask, rt_new_layout);
       }
+
+      // IW4 sun-shadow reproject (Track A) -- host-side trigger on the scene-color FALLING EDGE.
+      //
+      // The reproject blends shadow darkening into the host scene-color RT image, then IW4's post
+      // tonemap samples that image. Capture-proven (frame1071): the HDR scene color (RT 17067,
+      // R16G16B16A16, base 98) is consumed HOST-SIDE -- a fullscreen tonemap draw samples the RT
+      // image directly into the LDR target with NO guest-RAM color resolve of base 98 -- so the old
+      // resolve gate (IsResolveOfRecordedSceneColor) never matched the real scene path and the pass
+      // never issued (it is absent from the capture; no draw samples atlas+scene-depth together).
+      //
+      // The correct moment is the first Update where the recorded scene-color RT is no longer a
+      // bound color attachment: the world opaque/accumulation pass has just finished (scene color
+      // fully drawn, still in COLOR layout) and the tonemap pass that samples it is about to begin.
+      // We are before that pass's render pass is begun by the caller, and MaybeReprojectSunShadow
+      // issues its own self-contained BeginRendering/EndRendering, so ordering is safe.
+      if (sun_shadow_scene_color_rt_) {
+        bool scene_color_bound_now = false;
+        for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          if (depth_and_color_render_targets[i] == sun_shadow_scene_color_rt_) {
+            scene_color_bound_now = true;
+            break;
+          }
+        }
+        if (sun_shadow_scene_color_bound_prev_ && !scene_color_bound_now) {
+          // Falling edge -- world pass done, run the once-per-frame reproject now (guarded inside).
+          command_processor_.MaybeReprojectSunShadow();
+        }
+        sun_shadow_scene_color_bound_prev_ = scene_color_bound_now;
+      }
     } break;
 
     case Path::kPixelShaderInterlock: {
@@ -1808,6 +1837,7 @@ void VulkanRenderTargetCache::SunShadowFrameReset() {
     sun_shadow_scene_color_rt_ = nullptr;
     sun_shadow_scene_depth_rt_ = nullptr;
     sun_shadow_atlas_rt_ = nullptr;
+    sun_shadow_scene_color_bound_prev_ = false;
   }
 }
 

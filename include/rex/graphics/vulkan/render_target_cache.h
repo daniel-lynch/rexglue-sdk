@@ -342,6 +342,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   RenderTarget* sun_shadow_atlas_rt_ = nullptr;
   VkExtent2D sun_shadow_scene_extent_ = {};
   uint64_t sun_shadow_frame_ = 0;
+  // Tracks the scene-color RT bind state across Update() calls so the reproject can fire on the
+  // FALLING EDGE -- the first Update where the recorded scene-color RT is no longer a bound color
+  // attachment (i.e. the world opaque/accumulation pass just finished, and the post tonemap pass is
+  // about to sample the host scene-color image). Capture-proven (frame1071): IW4's HDR scene color
+  // (RT 17067, R16G16B16A16) is consumed HOST-SIDE -- a fullscreen tonemap draw samples the RT
+  // image directly into the LDR target -- with NO guest-RAM color resolve of base 98, so the old
+  // resolve-gated trigger (IsResolveOfRecordedSceneColor) never matched the real scene path. The
+  // falling edge is the correct host-side moment: 17067 is fully drawn, still in COLOR layout, not
+  // yet sampled. Reset each frame via sun_shadow_frame_.
+  bool sun_shadow_scene_color_bound_prev_ = false;
   // Resets the per-frame recorded RTs when the guest frame advances.
   void SunShadowFrameReset();
 

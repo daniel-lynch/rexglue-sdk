@@ -388,6 +388,23 @@ REXCVAR_DEFINE_BOOL(upload_batching, false, "GPU/Vulkan",
                     "remain as the fallback). Experimental.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// [bindcache] Per-frame texture/sampler descriptor-set content cache. The heavy 8k-draw scene
+// spends ~50% of the frame in UpdateBindings allocating + writing a fresh transient descriptor set
+// essentially every draw (~4.2us x 8000). Most of those sets are IDENTICAL (same material/texture
+// re-issued across hundreds of draws). When ON, the texture/sampler descriptor set is keyed by its
+// exact resolved contents (image views + samplers); a repeat key reuses the already-built+written
+// VkDescriptorSet instead of allocating and re-issuing vkUpdateDescriptorSets. The cache is
+// per-frame (cleared at the opening frame in BeginSubmission) so a reused handle is always a set
+// still owned by THIS frame (transient sets aren't recycled until the frame's GPU work finishes).
+// A miss is the unchanged original path. Default OFF — A/B against draw_bindings_us /
+// frame_time_us; the canary for a key bug is wrong textures / texture flicker on repeated surfaces.
+REXCVAR_DEFINE_BOOL(descriptor_set_cache, false, "GPU/Vulkan",
+                    "Reuse identical per-draw texture/sampler descriptor sets within a frame "
+                    "(keyed by the resolved image views + samplers) instead of allocating and "
+                    "re-writing one every draw. Cuts the dominant UpdateBindings per-draw cost on "
+                    "heavy scenes. Experimental; default off.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
 // [A2] Defined in primitive_processor.cpp: per-frame index-buffer upload nanoseconds. IssueSwap
 // reads + zeroes it and folds it into the upload-time phase counter.
@@ -6334,6 +6351,12 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     EvictOldReadbackBuffers(readback_buffers_);
     EvictOldReadbackBuffers(memexport_readback_buffers_);
 
+    // [bindcache] Drop the per-frame descriptor-set content cache. The transient sets it referenced
+    // are recycled into the free pool above once their frame completes; reusing a stale handle into
+    // a new frame would alias a set that may be re-allocated and re-written. A fresh empty cache
+    // each opening frame is the invalidation boundary.
+    binding_descriptor_set_cache_.clear();
+
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
@@ -8571,35 +8594,42 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   if (write_vertex_textures) {
     VkWriteDescriptorSet* write_textures =
         write_descriptor_sets.data() + write_descriptor_set_count;
+    // [bindcache] descriptor_set_out receives the chosen set even when the content cache hits and
+    // emits zero writes; a non-hit produces writes AND the set (write_textures[0].dstSet would
+    // equal it, but the out-param covers the zero-write hit case uniformly).
+    VkDescriptorSet vertex_textures_set = VK_NULL_HANDLE;
     uint32_t texture_descriptor_set_write_count = WriteTransientTextureBindings(
         true, texture_count_vertex, sampler_count_vertex,
         current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref(),
         descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
-        descriptor_write_image_info_.data() + vertex_sampler_image_info_offset, write_textures);
-    if (!texture_descriptor_set_write_count) {
+        descriptor_write_image_info_.data() + vertex_sampler_image_info_offset, write_textures,
+        &vertex_textures_set);
+    if (vertex_textures_set == VK_NULL_HANDLE) {
       return false;
     }
     write_descriptor_set_count += texture_descriptor_set_write_count;
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex] =
-        write_textures[0].dstSet;
+        vertex_textures_set;
   }
   // Pixel shader textures and samplers.
   if (write_pixel_textures) {
     VkWriteDescriptorSet* write_textures =
         write_descriptor_sets.data() + write_descriptor_set_count;
+    VkDescriptorSet pixel_textures_set = VK_NULL_HANDLE;
     uint32_t texture_descriptor_set_write_count = WriteTransientTextureBindings(
         false, texture_count_pixel, sampler_count_pixel,
         current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref(),
         descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
-        descriptor_write_image_info_.data() + pixel_sampler_image_info_offset, write_textures);
-    if (!texture_descriptor_set_write_count) {
+        descriptor_write_image_info_.data() + pixel_sampler_image_info_offset, write_textures,
+        &pixel_textures_set);
+    if (pixel_textures_set == VK_NULL_HANDLE) {
       return false;
     }
     write_descriptor_set_count += texture_descriptor_set_write_count;
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
-        write_textures[0].dstSet;
+        pixel_textures_set;
   }
   // Write.
   if (write_descriptor_set_count) {
@@ -8643,7 +8673,7 @@ uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
     bool is_vertex, uint32_t texture_count, uint32_t sampler_count,
     VkDescriptorSetLayout descriptor_set_layout, const VkDescriptorImageInfo* texture_image_info,
     const VkDescriptorImageInfo* sampler_image_info,
-    VkWriteDescriptorSet* descriptor_set_writes_out) {
+    VkWriteDescriptorSet* descriptor_set_writes_out, VkDescriptorSet* descriptor_set_out) {
   assert_true(frame_open_);
   if (!texture_count && !sampler_count) {
     return 0;
@@ -8652,6 +8682,39 @@ uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
   texture_descriptor_set_layout_key.texture_count = texture_count;
   texture_descriptor_set_layout_key.sampler_count = sampler_count;
   texture_descriptor_set_layout_key.is_vertex = uint32_t(is_vertex);
+
+  // [bindcache] Per-frame content cache fast path (cvar `descriptor_set_cache`, default OFF).
+  // Build a key from the layout + the exact resolved descriptor contents (image views, then
+  // samplers). On a hit, reuse the already-written set and emit zero writes — the caller takes the
+  // returned set from `descriptor_set_out`. The contents fully determine a sampled-image/sampler
+  // descriptor set, and the set stays valid+unmodified for the rest of the frame, so reuse is
+  // exact. Cleared every opening frame in BeginSubmission.
+  const bool bindcache_on = REXCVAR_GET(descriptor_set_cache);
+  BindingCacheKey bindcache_key;
+  if (bindcache_on) {
+    bindcache_key.layout_key = texture_descriptor_set_layout_key.key;
+    binding_cache_scratch_handles_.clear();
+    binding_cache_scratch_handles_.reserve(size_t(texture_count) + sampler_count);
+    for (uint32_t i = 0; i < texture_count; ++i) {
+      // Image layout is a pure function of (imageView != NULL), so the view handle alone
+      // distinguishes content; null views all share UNDEFINED layout.
+      binding_cache_scratch_handles_.push_back(
+          uint64_t(reinterpret_cast<uintptr_t>(texture_image_info[i].imageView)));
+    }
+    for (uint32_t i = 0; i < sampler_count; ++i) {
+      binding_cache_scratch_handles_.push_back(
+          uint64_t(reinterpret_cast<uintptr_t>(sampler_image_info[i].sampler)));
+    }
+    bindcache_key.handles = binding_cache_scratch_handles_;
+    auto cache_it = binding_descriptor_set_cache_.find(bindcache_key);
+    if (cache_it != binding_descriptor_set_cache_.end()) {
+      if (descriptor_set_out) {
+        *descriptor_set_out = cache_it->second;
+      }
+      return 0;
+    }
+  }
+
   VkDescriptorSet texture_descriptor_set;
   auto textures_free_it =
       texture_transient_descriptor_sets_free_.find(texture_descriptor_set_layout_key);
@@ -8716,6 +8779,16 @@ uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
     descriptor_set_write.pTexelBufferView = nullptr;
   }
   assert_not_zero(descriptor_set_write_count);
+  if (descriptor_set_out) {
+    *descriptor_set_out = texture_descriptor_set;
+  }
+  // [bindcache] Record the freshly built+written set under its content key for the rest of this
+  // frame. Safe because the set is now in texture_transient_descriptor_sets_used_ (not recycled
+  // until the frame completes) and the writes below make its contents match the key. Cleared at
+  // the next opening frame.
+  if (bindcache_on) {
+    binding_descriptor_set_cache_.emplace(std::move(bindcache_key), texture_descriptor_set);
+  }
   return descriptor_set_write_count;
 }
 

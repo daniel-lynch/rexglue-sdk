@@ -582,7 +582,8 @@ class VulkanCommandProcessor : public CommandProcessor {
                                          VkDescriptorSetLayout descriptor_set_layout,
                                          const VkDescriptorImageInfo* texture_image_info,
                                          const VkDescriptorImageInfo* sampler_image_info,
-                                         VkWriteDescriptorSet* descriptor_set_writes_out);
+                                         VkWriteDescriptorSet* descriptor_set_writes_out,
+                                         VkDescriptorSet* descriptor_set_out);
 
   bool device_lost_ = false;
 
@@ -708,6 +709,45 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unordered_map<TextureDescriptorSetLayoutKey, std::vector<VkDescriptorSet>,
                      TextureDescriptorSetLayoutKey::Hasher>
       texture_transient_descriptor_sets_free_;
+
+  // [bindcache] Per-frame texture/sampler descriptor-set content cache (cvar
+  // `descriptor_set_cache`, default OFF). Keyed by the exact resolved contents of a
+  // texture/sampler descriptor set (the layout key + the sequence of VkImageView and VkSampler
+  // handles that would be written). When consecutive/repeat draws share a material -> identical
+  // image views + samplers -> identical key, so the previously built+written VkDescriptorSet for
+  // that key is reused instead of allocating a fresh transient set and re-issuing
+  // vkUpdateDescriptorSets. SAFE because (a) the content fully determines a sampled-image/sampler
+  // descriptor set, (b) within a frame an allocated transient set is never recycled until the
+  // frame's GPU work completes (texture_transient_descriptor_sets_used_ holds it), so a cached
+  // handle stays valid+unmodified for the rest of the frame, and (c)
+  // GetActiveBindingOrNullImageView / UseSampler resolve fresh each draw, so a re-decoded texture /
+  // changed sampler yields a different key and forces a rebuild. The cache is CLEARED at the start
+  // of every opening frame (BeginSubmission) — handles from a prior frame must never be reused
+  // (their transient sets get recycled into the free pool). This is purely additive: a miss takes
+  // the original path.
+  struct BindingCacheKey {
+    uint32_t layout_key;  // TextureDescriptorSetLayoutKey::key (texture_count|sampler_count|vertex)
+    // Resolved descriptor contents, in dst order: texture_count image views then sampler_count
+    // samplers. Sized to the worst case the pipeline layouts support (kMaxTextureBindings /
+    // kMaxSamplerBindings would be ideal, but a small inline vector keeps it allocation-light).
+    std::vector<uint64_t> handles;
+    bool operator==(const BindingCacheKey& o) const {
+      return layout_key == o.layout_key && handles == o.handles;
+    }
+  };
+  struct BindingCacheKeyHasher {
+    size_t operator()(const BindingCacheKey& k) const {
+      size_t h = std::hash<uint32_t>{}(k.layout_key);
+      for (uint64_t v : k.handles) {
+        h ^= std::hash<uint64_t>{}(v) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+      }
+      return h;
+    }
+  };
+  std::unordered_map<BindingCacheKey, VkDescriptorSet, BindingCacheKeyHasher>
+      binding_descriptor_set_cache_;
+  // Scratch reused across draws to build a BindingCacheKey without per-draw heap churn.
+  std::vector<uint64_t> binding_cache_scratch_handles_;
 
   std::unique_ptr<VulkanSharedMemory> shared_memory_;
 
