@@ -140,6 +140,54 @@ REXCVAR_DEFINE_DOUBLE(fog_density_scale, 1.0, "GPU/Vulkan",
                       "atmospheric haze (1.0 = off, >1 = denser fog)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// IW4 SUN-SHADOW REPROJECT (dark-scene Track A). The IW4 sun shadowmap IS rendered (a tall D32
+// partitioned atlas) but the world opaque pass runs the *non-shadow* LIT_SUN (0xB) technique, so
+// shadowed surfaces never get darkened (our canyon wall reads ~0.41 lit where the 360 reference is
+// ~0.23 in shadow). We can't make the guest select the shadow technique (the choice lives in
+// compiled engine code), so this reconstructs a screen-space sun-shadow: a fragment pass before the
+// scene-color resolve reconstructs world pos from the scene depth, projects into the captured sun
+// view-proj, PCF-compares the captured sun shadowmap, and MULTIPLIES the scene color toward this
+// strength where the pixel is occluded from the sun. 1.0 = off (no pass). <1 = shadow darkness
+// floor (e.g. 0.55). Binary/map-agnostic (resource signatures + matrices captured at draw time, no
+// guest addresses) so it covers SP + MP. Hot-reloadable.
+REXCVAR_DEFINE_DOUBLE(sun_shadow_reproject, 1.0, "GPU/Vulkan",
+                      "Screen-space sun-shadow reproject: multiply scene color toward this value "
+                      "where occluded from the sun (1.0 = off, <1 = shadow darkness floor)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Depth-compare bias (sun-clip Z units) to suppress shadow acne, and PCF softening radius in
+// shadowmap texels. Hot-reloadable for live tuning against the reference.
+REXCVAR_DEFINE_DOUBLE(sun_shadow_bias, 0.0025, "GPU/Vulkan",
+                      "Sun-shadow reproject depth-compare bias in sun-clip Z (anti-acne)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Debug: 0 = normal multiply; 1 = write the shadow visibility as a grayscale heatmap (lit=white,
+// shadow=gray floor) to validate the reprojection geometry/matrices before trusting the multiply.
+REXCVAR_DEFINE_INT32(sun_shadow_debug, 0, "GPU/Vulkan",
+                     "Sun-shadow reproject debug (0 = multiply, 1 = visibility heatmap)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Guest VS float-constant register (c#) where IW4 uploads the world->clip view-proj (scene) and the
+// sun's world->clip view-proj (shadowmap build). -1 = auto-detect (the 4-vec4 block forming a
+// plausible projection matrix, identical across the pass's draws). Override if auto-detect misfires
+// (a wrong register shows as a garbled heatmap). Discovered/validated via sun_shadow_debug=1.
+REXCVAR_DEFINE_INT32(sun_shadow_scene_vp_reg, -1, "GPU/Vulkan",
+                     "Guest VS c# of the scene view-proj matrix (-1 = auto-detect)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(sun_shadow_sun_vp_reg, -1, "GPU/Vulkan",
+                     "Guest VS c# of the sun (shadowmap-build) view-proj matrix (-1 = auto-detect)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// The captured matrices are row-major as stored in the constant buffer; GLSL reads a float[16] as
+// column-major, so the as-is upload is already the transpose the math needs. If the guest stores
+// them pre-transposed, flip this to correct the reprojection (tuned live via the heatmap). 0 = as
+// stored (default), 1 = transpose both matrices before use.
+REXCVAR_DEFINE_INT32(sun_shadow_transpose, 0, "GPU/Vulkan",
+                     "Transpose the captured sun-shadow matrices (0 = as stored, 1 = transpose)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Depth-compare direction (IW4 may use reverse-Z): a scene point is in shadow when its sun-space
+// depth is, in this sign, beyond the stored shadowmap depth. Flip to -1.0 if the heatmap is
+// inverted (everything lit or everything shadowed). Tuned live with the heatmap.
+REXCVAR_DEFINE_DOUBLE(sun_shadow_compare, 1.0, "GPU/Vulkan",
+                      "Sun-shadow depth-compare sign (+1 or -1; flip if the heatmap is inverted)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // ---- Live-tuning harness (dark-scene work)
 // ------------------------------------------------------- When `live_tune_file` is a non-empty
 // path, IssueSwap polls that file once per frame and, on mtime change, re-applies it via
@@ -2243,6 +2291,16 @@ void VulkanCommandProcessor::ShutdownContext() {
   const VkDevice device = vulkan_device->device();
 
   DestroyScratchBuffer();
+
+  // Sun-shadow reproject (Track A) resources (descriptor sets are freed with the pool).
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, sun_shadow_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         sun_shadow_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         sun_shadow_descriptor_set_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         sun_shadow_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroySampler, device, sun_shadow_sampler_);
 
   for (auto& readback_pair : readback_buffers_) {
     ReadbackBuffer& readback = readback_pair.second;
@@ -7162,6 +7220,547 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   }
 }
 
+void VulkanCommandProcessor::CaptureSunShadowMatrices(const VulkanShader* vertex_shader) {
+  // No-op unless the reproject is enabled (default 1.0 = off => zero overhead in normal runs).
+  if (std::fabs(float(REXCVAR_GET(sun_shadow_reproject)) - 1.0f) < 1e-4f || !vertex_shader) {
+    return;
+  }
+  // Frame boundary: drop last frame's captures so a frame without the sun-build pass disables the
+  // reproject (a stale sun matrix would shadow the wrong pixels) rather than using old data.
+  if (sun_shadow_capture_frame_ != frame_current_) {
+    sun_shadow_capture_frame_ = frame_current_;
+    sun_shadow_scene_vp_valid_ = false;
+    sun_shadow_sun_vp_valid_ = false;
+  }
+  const bool sun_was_valid = sun_shadow_sun_vp_valid_;
+  const bool scene_was_valid = sun_shadow_scene_vp_valid_;
+
+  const RegisterFile& regs = *register_file_;
+  const Shader::ConstantRegisterMap& map = vertex_shader->constant_register_map();
+
+  // The reliable separator is the render target (the IW4 projection register c0-c3 holds the sun
+  // shadowmap VP in shadow-caster draws and the camera VP in scene draws — depth-only-vs-pixel-shader
+  // can't tell them apart because alpha shadow casters have a pixel shader). Classify by RT:
+  //   1 = main scene (camera VP at c0-c3), 2 = sun shadowmap build (sun VP at c0-c3).
+  const int cls = render_target_cache_ ? render_target_cache_->ClassifyCurrentDrawForSunShadow() : 0;
+  if (cls == 0) {
+    return;
+  }
+
+  // Read an aligned 4-register block (c[base..base+3]) from the VS float constants. The IW4 VP sits
+  // at c0 (confirmed from the shadow-caster dumps); overridable via the cvars.
+  auto reg_used = [&](uint32_t reg) -> bool {
+    return reg < 256 && ((map.float_bitmap[reg >> 6] >> (reg & 63)) & 1) != 0;
+  };
+  auto read_block = [&](uint32_t base, float m[16]) {
+    for (uint32_t r = 0; r < 4; ++r) {
+      std::memcpy(&m[r * 4], &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + ((base + r) << 2)],
+                  sizeof(float) * 4);
+    }
+  };
+  const int32_t scene_reg_override = REXCVAR_GET(sun_shadow_scene_vp_reg);
+  const int32_t sun_reg_override = REXCVAR_GET(sun_shadow_sun_vp_reg);
+  const uint32_t scene_reg = scene_reg_override >= 0 ? uint32_t(scene_reg_override) : 0;
+  const uint32_t sun_reg = sun_reg_override >= 0 ? uint32_t(sun_reg_override) : 0;
+
+  if (cls == 1 && !sun_shadow_scene_vp_valid_ && reg_used(scene_reg)) {
+    read_block(scene_reg, sun_shadow_scene_vp_);
+    sun_shadow_scene_vp_valid_ = true;
+  } else if (cls == 2 && !sun_shadow_sun_vp_valid_ && reg_used(sun_reg)) {
+    read_block(sun_reg, sun_shadow_sun_vp_);
+    sun_shadow_sun_vp_valid_ = true;
+  }
+
+  // Continuous heartbeat (sun_shadow_debug): once per ~300-frame window on a scene/sun draw, record
+  // whether each side is firing in-game (the per-epoch matrix dump alone only sampled boot).
+  if (REXCVAR_GET(sun_shadow_debug)) {
+    static uint64_t hb_window = ~0ull;
+    const uint64_t w = frame_current_ / 300;
+    if (w != hb_window) {
+      hb_window = w;
+      if (std::FILE* f = std::fopen("/tmp/mw2_sunshadow.txt", "a")) {
+        std::fprintf(f, "HB f=%llu cls=%d scene_valid=%d sun_valid=%d reg_used(%u)=%d\n",
+                     static_cast<unsigned long long>(frame_current_), cls,
+                     int(sun_shadow_scene_vp_valid_), int(sun_shadow_sun_vp_valid_),
+                     cls == 2 ? sun_reg : scene_reg, int(reg_used(cls == 2 ? sun_reg : scene_reg)));
+        std::fclose(f);
+      }
+    }
+  }
+
+  // DIAGNOSTIC dump (sun_shadow_debug): the SDK gpu logger is filtered from stdout in this build, so
+  // dump the captured c0-c3 block to a file per epoch (~1800 frames) to confirm the matrices offline.
+  if (REXCVAR_GET(sun_shadow_debug)) {
+    const uint64_t epoch = frame_current_ / 1800;
+    if (epoch != sun_shadow_dump_epoch_) {
+      sun_shadow_dump_epoch_ = epoch;
+      sun_shadow_dump_depth_n_ = 0;
+      sun_shadow_dump_scene_n_ = 0;
+    }
+    uint32_t& dump_n = (cls == 2) ? sun_shadow_dump_depth_n_ : sun_shadow_dump_scene_n_;
+    if (dump_n < 2) {
+      ++dump_n;
+      if (std::FILE* f = std::fopen("/tmp/mw2_sunshadow.txt", "a")) {
+        float mm[16];
+        read_block(cls == 2 ? sun_reg : scene_reg, mm);
+        std::fprintf(f, "== %s VP frame=%llu c%u-c%u ==\n", cls == 2 ? "SUN(shadowmap)" : "SCENE",
+                     static_cast<unsigned long long>(frame_current_), cls == 2 ? sun_reg : scene_reg,
+                     (cls == 2 ? sun_reg : scene_reg) + 3);
+        for (int r = 0; r < 4; ++r) {
+          std::fprintf(f, "   % .4f % .4f % .4f % .4f\n", mm[r * 4], mm[r * 4 + 1], mm[r * 4 + 2],
+                       mm[r * 4 + 3]);
+        }
+        std::fclose(f);
+      }
+    }
+  }
+
+  // Record the render targets the reproject pass needs when a matrix was freshly captured.
+  if (!sun_was_valid && sun_shadow_sun_vp_valid_ && render_target_cache_) {
+    render_target_cache_->NoteSunShadowDepthRenderTarget();
+  }
+  if (!scene_was_valid && sun_shadow_scene_vp_valid_ && render_target_cache_) {
+    render_target_cache_->NoteSceneColorDepthRenderTargets();
+  }
+}
+
+void VulkanCommandProcessor::MaybeReprojectSunShadow() {
+  // No-op unless enabled.
+  if (std::fabs(float(REXCVAR_GET(sun_shadow_reproject)) - 1.0f) < 1e-4f || !render_target_cache_) {
+    return;
+  }
+  // Run at most once per frame (called from each scene-color resolve).
+  if (sun_shadow_reproject_frame_ == frame_current_) {
+    return;
+  }
+  float scene_vp[16], sun_vp[16];
+  if (!GetSunShadowMatrices(scene_vp, sun_vp)) {
+    return;
+  }
+  VulkanRenderTargetCache::SunShadowReprojectInputs inputs;
+  if (!render_target_cache_->PrepareSunShadowReproject(inputs)) {
+    return;
+  }
+  sun_shadow_reproject_frame_ = frame_current_;
+
+  if (REXCVAR_GET(sun_shadow_debug)) {
+    static std::atomic<uint32_t> ready_n{0};
+    if (ready_n.fetch_add(1) < 3) {
+      if (std::FILE* f = std::fopen("/tmp/mw2_sunshadow.txt", "a")) {
+        std::fprintf(f,
+                     "== REPROJECT READY frame=%llu extent=%ux%u msaa=%u color_fmt=%d ==\n"
+                     "  sceneVP.row0= % .4f % .4f % .4f % .4f\n"
+                     "  sunVP.row0  = % .4f % .4f % .4f % .4f\n",
+                     static_cast<unsigned long long>(frame_current_), inputs.extent.width,
+                     inputs.extent.height, uint32_t(inputs.msaa_samples),
+                     int32_t(inputs.scene_color_format), scene_vp[0], scene_vp[1], scene_vp[2],
+                     scene_vp[3], sun_vp[0], sun_vp[1], sun_vp[2], sun_vp[3]);
+        std::fclose(f);
+      }
+    }
+  }
+
+  if (!EnsureSunShadowPipeline(inputs.scene_color_format, inputs.msaa_samples)) {
+    return;
+  }
+  DrawSunShadowReproject(inputs, scene_vp, sun_vp);
+}
+
+namespace {
+// Fullscreen-triangle vertex shader (no vertex input).
+const char* kSunShadowVsSource = R"(#version 450
+layout(location = 0) out vec2 xe_uv;
+void main() {
+  vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));
+  xe_uv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+})";
+
+// Reconstruct world pos from the (multisampled) scene depth, project into the captured sun view-proj,
+// compare against the sun shadowmap, and output a multiply factor (debug => raw visibility).
+const char* kSunShadowFsSource = R"(#version 450
+layout(location = 0) in vec2 xe_uv;
+layout(location = 0) out vec4 xe_out;
+layout(set = 0, binding = 0) uniform texture2DMS xe_scene_depth;
+layout(set = 0, binding = 1) uniform texture2D xe_sun_atlas;
+layout(set = 0, binding = 2) uniform sampler xe_samp;
+layout(push_constant) uniform XePC {
+  mat4 inv_scene_vp;  // clip -> world
+  mat4 sun_vp;        // world -> sun clip
+  vec4 params;        // x=strength, y=bias, z=debug, w=compare_sign
+} pc;
+void main() {
+  ivec2 px = ivec2(gl_FragCoord.xy);
+  float d = texelFetch(xe_scene_depth, px, 0).r;
+  vec2 ndc = xe_uv * 2.0 - 1.0;
+  vec4 world = pc.inv_scene_vp * vec4(ndc, d, 1.0);
+  world /= world.w;
+  vec4 sc = pc.sun_vp * world;
+  sc /= sc.w;
+  vec2 suv = sc.xy * 0.5 + 0.5;
+  float vis = 1.0;
+  if (all(greaterThanEqual(suv, vec2(0.0))) && all(lessThanEqual(suv, vec2(1.0))) &&
+      sc.z >= 0.0 && sc.z <= 1.0) {
+    float sd = texture(sampler2D(xe_sun_atlas, xe_samp), suv).r;
+    // Occluded when the scene point is, in the compare sign, beyond the nearest sun occluder.
+    bool occluded = (pc.params.w * (sc.z - pc.params.y)) > (pc.params.w * sd);
+    vis = occluded ? 0.0 : 1.0;
+  }
+  float f = (pc.params.z > 0.5) ? vis : mix(pc.params.x, 1.0, vis);
+  xe_out = vec4(f, f, f, 1.0);
+})";
+
+// Invert a row-major 4x4 (returns false if singular).
+bool InvertMatrix4x4RowMajor(const float m[16], float out[16]) {
+  float inv[16];
+  inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] +
+           m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+  inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] -
+           m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+  inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] +
+           m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+  inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] -
+            m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+  inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] -
+           m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+  inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] +
+           m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+  inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] -
+           m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+  inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] +
+            m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+  inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] +
+           m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+  inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] -
+           m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+  inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] +
+            m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+  inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] -
+            m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+  inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] -
+           m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+  inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] +
+           m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+  inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] -
+            m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+  inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] +
+            m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+  float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+  if (std::fabs(det) < 1e-20f) {
+    return false;
+  }
+  det = 1.0f / det;
+  for (int i = 0; i < 16; ++i) {
+    out[i] = inv[i] * det;
+  }
+  return true;
+}
+
+void TransposeMatrix4x4(const float m[16], float out[16]) {
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      out[c * 4 + r] = m[r * 4 + c];
+    }
+  }
+}
+}  // namespace
+
+bool VulkanCommandProcessor::EnsureSunShadowPipeline(VkFormat color_format,
+                                                     xenos::MsaaSamples msaa_samples) {
+  if (sun_shadow_pipeline_failed_) {
+    return false;
+  }
+  if (sun_shadow_pipeline_ != VK_NULL_HANDLE && sun_shadow_pipeline_color_format_ == color_format &&
+      sun_shadow_pipeline_samples_ == msaa_samples) {
+    return true;
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  // Destroy a stale pipeline (sample count / format changed) and rebuild.
+  if (sun_shadow_pipeline_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipeline(device, sun_shadow_pipeline_, nullptr);
+    sun_shadow_pipeline_ = VK_NULL_HANDLE;
+  }
+
+  // One-time: descriptor set layout (scene depth + sun atlas + sampler), pipeline layout, sampler,
+  // descriptor pool + ring of sets.
+  if (sun_shadow_descriptor_set_layout_ == VK_NULL_HANDLE) {
+    VkDescriptorSetLayoutBinding bindings[3] = {};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[1] = bindings[0];
+    bindings[1].binding = 1;
+    bindings[2] = bindings[0];
+    bindings[2].binding = 2;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    VkDescriptorSetLayoutCreateInfo dsl_info = {};
+    dsl_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dsl_info.bindingCount = 3;
+    dsl_info.pBindings = bindings;
+    if (dfn.vkCreateDescriptorSetLayout(device, &dsl_info, nullptr,
+                                        &sun_shadow_descriptor_set_layout_) != VK_SUCCESS) {
+      sun_shadow_pipeline_failed_ = true;
+      return false;
+    }
+    VkPushConstantRange pc_range = {};
+    pc_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pc_range.offset = 0;
+    pc_range.size = sizeof(float) * 36;  // 2 mat4 + vec4
+    VkPipelineLayoutCreateInfo pl_info = {};
+    pl_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl_info.setLayoutCount = 1;
+    pl_info.pSetLayouts = &sun_shadow_descriptor_set_layout_;
+    pl_info.pushConstantRangeCount = 1;
+    pl_info.pPushConstantRanges = &pc_range;
+    if (dfn.vkCreatePipelineLayout(device, &pl_info, nullptr, &sun_shadow_pipeline_layout_) !=
+        VK_SUCCESS) {
+      sun_shadow_pipeline_failed_ = true;
+      return false;
+    }
+    VkSamplerCreateInfo samp_info = {};
+    samp_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samp_info.magFilter = VK_FILTER_LINEAR;
+    samp_info.minFilter = VK_FILTER_LINEAR;
+    samp_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samp_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samp_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samp_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samp_info.maxLod = VK_LOD_CLAMP_NONE;
+    if (dfn.vkCreateSampler(device, &samp_info, nullptr, &sun_shadow_sampler_) != VK_SUCCESS) {
+      sun_shadow_pipeline_failed_ = true;
+      return false;
+    }
+    VkDescriptorPoolSize pool_sizes[2] = {};
+    pool_sizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    pool_sizes[0].descriptorCount = 2 * kSunShadowDescriptorRing;
+    pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    pool_sizes[1].descriptorCount = kSunShadowDescriptorRing;
+    VkDescriptorPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets = kSunShadowDescriptorRing;
+    pool_info.poolSizeCount = 2;
+    pool_info.pPoolSizes = pool_sizes;
+    if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &sun_shadow_descriptor_pool_) !=
+        VK_SUCCESS) {
+      sun_shadow_pipeline_failed_ = true;
+      return false;
+    }
+    for (uint32_t i = 0; i < kSunShadowDescriptorRing; ++i) {
+      VkDescriptorSetAllocateInfo set_info = {};
+      set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+      set_info.descriptorPool = sun_shadow_descriptor_pool_;
+      set_info.descriptorSetCount = 1;
+      set_info.pSetLayouts = &sun_shadow_descriptor_set_layout_;
+      if (dfn.vkAllocateDescriptorSets(device, &set_info, &sun_shadow_descriptor_sets_[i]) !=
+          VK_SUCCESS) {
+        sun_shadow_pipeline_failed_ = true;
+        return false;
+      }
+    }
+  }
+
+  // Compile the shaders.
+  std::vector<uint32_t> vs_spirv, fs_spirv;
+  std::string err;
+  if (!CompileGlslToSpirvInternal(EShLangVertex, kSunShadowVsSource, vs_spirv, err) ||
+      !CompileGlslToSpirvInternal(EShLangFragment, kSunShadowFsSource, fs_spirv, err)) {
+    REXGPU_ERROR("[MW2-SUNSHADOW] shader compile failed: {}", err);
+    sun_shadow_pipeline_failed_ = true;
+    return false;
+  }
+  VkShaderModule vs_module =
+      ui::vulkan::util::CreateShaderModule(vulkan_device, vs_spirv.data(), vs_spirv.size() * 4);
+  VkShaderModule fs_module =
+      ui::vulkan::util::CreateShaderModule(vulkan_device, fs_spirv.data(), fs_spirv.size() * 4);
+  if (vs_module == VK_NULL_HANDLE || fs_module == VK_NULL_HANDLE) {
+    if (vs_module != VK_NULL_HANDLE) dfn.vkDestroyShaderModule(device, vs_module, nullptr);
+    if (fs_module != VK_NULL_HANDLE) dfn.vkDestroyShaderModule(device, fs_module, nullptr);
+    sun_shadow_pipeline_failed_ = true;
+    return false;
+  }
+
+  VkPipelineShaderStageCreateInfo stages[2] = {};
+  stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[0].module = vs_module;
+  stages[0].pName = "main";
+  stages[1] = stages[0];
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  stages[1].module = fs_module;
+
+  VkPipelineVertexInputStateCreateInfo vtx = {};
+  vtx.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+  VkPipelineInputAssemblyStateCreateInfo ia = {};
+  ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+  ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineViewportStateCreateInfo vp = {};
+  vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+  vp.viewportCount = 1;
+  vp.scissorCount = 1;
+  VkPipelineRasterizationStateCreateInfo rs = {};
+  rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+  rs.polygonMode = VK_POLYGON_MODE_FILL;
+  rs.cullMode = VK_CULL_MODE_NONE;
+  rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  rs.lineWidth = 1.0f;
+  VkPipelineMultisampleStateCreateInfo ms = {};
+  ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+  ms.rasterizationSamples =
+      static_cast<VkSampleCountFlagBits>(uint32_t(1) << uint32_t(msaa_samples));
+  VkPipelineDepthStencilStateCreateInfo ds = {};
+  ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+  // Multiply blend: result = dst * src.
+  VkPipelineColorBlendAttachmentState blend = {};
+  blend.blendEnable = VK_TRUE;
+  blend.srcColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR;
+  blend.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+  blend.colorBlendOp = VK_BLEND_OP_ADD;
+  blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+  blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+  blend.alphaBlendOp = VK_BLEND_OP_ADD;
+  blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  VkPipelineColorBlendStateCreateInfo cb = {};
+  cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+  cb.attachmentCount = 1;
+  cb.pAttachments = &blend;
+  VkDynamicState dyn_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dyn = {};
+  dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+  dyn.dynamicStateCount = 2;
+  dyn.pDynamicStates = dyn_states;
+
+  VkPipelineRenderingCreateInfo rendering_info = {};
+  rendering_info.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+  rendering_info.colorAttachmentCount = 1;
+  rendering_info.pColorAttachmentFormats = &color_format;
+
+  VkGraphicsPipelineCreateInfo pipe_info = {};
+  pipe_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+  pipe_info.pNext = &rendering_info;
+  pipe_info.stageCount = 2;
+  pipe_info.pStages = stages;
+  pipe_info.pVertexInputState = &vtx;
+  pipe_info.pInputAssemblyState = &ia;
+  pipe_info.pViewportState = &vp;
+  pipe_info.pRasterizationState = &rs;
+  pipe_info.pMultisampleState = &ms;
+  pipe_info.pDepthStencilState = &ds;
+  pipe_info.pColorBlendState = &cb;
+  pipe_info.pDynamicState = &dyn;
+  pipe_info.layout = sun_shadow_pipeline_layout_;
+  VkResult pipe_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipe_info,
+                                                       nullptr, &sun_shadow_pipeline_);
+  dfn.vkDestroyShaderModule(device, vs_module, nullptr);
+  dfn.vkDestroyShaderModule(device, fs_module, nullptr);
+  if (pipe_result != VK_SUCCESS) {
+    REXGPU_ERROR("[MW2-SUNSHADOW] pipeline create failed: {}", int32_t(pipe_result));
+    sun_shadow_pipeline_failed_ = true;
+    return false;
+  }
+  sun_shadow_pipeline_color_format_ = color_format;
+  sun_shadow_pipeline_samples_ = msaa_samples;
+  return true;
+}
+
+void VulkanCommandProcessor::DrawSunShadowReproject(
+    const VulkanRenderTargetCache::SunShadowReprojectInputs& inputs, const float scene_vp[16],
+    const float sun_vp[16]) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  DeferredCommandBuffer& command_buffer = deferred_command_buffer_;
+
+  // Apply the optional transpose (matrix-convention toggle), then build the push constants:
+  // inv(scene_vp) for clip->world and sun_vp for world->sun-clip (see InvertMatrix4x4RowMajor for
+  // the row-major / GLSL column-major reasoning).
+  float scene_m[16], sun_m[16];
+  if (REXCVAR_GET(sun_shadow_transpose)) {
+    TransposeMatrix4x4(scene_vp, scene_m);
+    TransposeMatrix4x4(sun_vp, sun_m);
+  } else {
+    std::memcpy(scene_m, scene_vp, sizeof(scene_m));
+    std::memcpy(sun_m, sun_vp, sizeof(sun_m));
+  }
+  struct PushConstants {
+    float inv_scene_vp[16];
+    float sun_vp[16];
+    float params[4];
+  } pc;
+  if (!InvertMatrix4x4RowMajor(scene_m, pc.inv_scene_vp)) {
+    return;  // singular scene matrix (bad capture) — skip this frame
+  }
+  std::memcpy(pc.sun_vp, sun_m, sizeof(pc.sun_vp));
+  pc.params[0] = float(REXCVAR_GET(sun_shadow_reproject));
+  pc.params[1] = float(REXCVAR_GET(sun_shadow_bias));
+  pc.params[2] = REXCVAR_GET(sun_shadow_debug) ? 1.0f : 0.0f;
+  pc.params[3] = float(REXCVAR_GET(sun_shadow_compare));
+
+  // Update this frame's descriptor set (ring avoids touching a set still in flight).
+  VkDescriptorSet set = sun_shadow_descriptor_sets_[frame_current_ % kSunShadowDescriptorRing];
+  VkDescriptorImageInfo depth_image = {};
+  depth_image.imageView = inputs.scene_depth_view;
+  depth_image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkDescriptorImageInfo atlas_image = {};
+  atlas_image.imageView = inputs.atlas_view;
+  atlas_image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkDescriptorImageInfo sampler_info = {};
+  sampler_info.sampler = sun_shadow_sampler_;
+  VkWriteDescriptorSet writes[3] = {};
+  writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[0].dstSet = set;
+  writes[0].dstBinding = 0;
+  writes[0].descriptorCount = 1;
+  writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  writes[0].pImageInfo = &depth_image;
+  writes[1] = writes[0];
+  writes[1].dstBinding = 1;
+  writes[1].pImageInfo = &atlas_image;
+  writes[2] = writes[0];
+  writes[2].dstBinding = 2;
+  writes[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+  writes[2].pImageInfo = &sampler_info;
+  dfn.vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+
+  // Submit any pending barriers (the depth-RT transitions) before the render pass.
+  SubmitBarriers(true);
+
+  VkRenderingAttachmentInfo color_attachment = {};
+  color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  color_attachment.imageView = inputs.scene_color_view;
+  color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkRenderingInfo rendering = {};
+  rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  rendering.renderArea.extent = inputs.extent;
+  rendering.layerCount = 1;
+  rendering.colorAttachmentCount = 1;
+  rendering.pColorAttachments = &color_attachment;
+  command_buffer.CmdVkBeginRendering(&rendering);
+
+  VkViewport viewport = {};
+  viewport.width = float(inputs.extent.width);
+  viewport.height = float(inputs.extent.height);
+  viewport.maxDepth = 1.0f;
+  command_buffer.CmdVkSetViewport(0, 1, &viewport);
+  VkRect2D scissor = {};
+  scissor.extent = inputs.extent;
+  command_buffer.CmdVkSetScissor(0, 1, &scissor);
+  command_buffer.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, sun_shadow_pipeline_);
+  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                         sun_shadow_pipeline_layout_, 0, 1, &set, 0, nullptr);
+  command_buffer.CmdVkPushConstants(sun_shadow_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                    sizeof(pc), &pc);
+  command_buffer.CmdVkDraw(3, 1, 0, 0);
+  command_buffer.CmdVkEndRendering();
+}
+
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                             const VulkanShader* pixel_shader) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -7173,6 +7772,10 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+
+  // IW4 sun-shadow reproject (Track A): capture the scene/sun view-proj matrices from this draw's
+  // VS float constants (no-op unless the cvar is enabled). Must run every draw (the camera moves).
+  CaptureSunShadowMatrices(vertex_shader);
 
   // Invalidate constant buffers and descriptors for changed data.
 

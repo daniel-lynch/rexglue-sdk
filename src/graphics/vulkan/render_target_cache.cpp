@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -61,6 +63,10 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
 //     "  Choose what is considered the most optimal for the system (currently "
 //     "always FB because the FSI path is much slower now).",
 //     "GPU");
+
+// Defined in command_processor.cpp (Track A sun-shadow reproject); used here for the RT diagnostic.
+// Declared at global scope to match the global-scope definition.
+REXCVAR_DECLARE(int32_t, sun_shadow_debug);
 
 namespace rex::graphics::vulkan {
 
@@ -1349,6 +1355,11 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     return true;
   }
 
+  // IW4 sun-shadow reproject (Track A): run the screen-space sun shadow into the scene color RT
+  // before it is dumped/resolved (so bloom/tonemap see the darkened result). No-op unless enabled
+  // and all inputs were recorded this frame; guarded to once per frame internally.
+  command_processor_.MaybeReprojectSunShadow();
+
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -1774,6 +1785,166 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     }
   }
   *color_attachment_count_out = color_attachment_count;
+}
+
+// ---- IW4 sun-shadow reproject (Track A) ------------------------------------------------------
+
+void VulkanRenderTargetCache::SunShadowFrameReset() {
+  const uint64_t frame = command_processor_.GetCurrentFrame();
+  if (sun_shadow_frame_ != frame) {
+    sun_shadow_frame_ = frame;
+    sun_shadow_scene_color_rt_ = nullptr;
+    sun_shadow_scene_depth_rt_ = nullptr;
+    sun_shadow_atlas_rt_ = nullptr;
+  }
+}
+
+void VulkanRenderTargetCache::NoteSunShadowDepthRenderTarget() {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return;
+  }
+  SunShadowFrameReset();
+  RenderTarget* const* rts = last_update_accumulated_render_targets();
+  if (rts[0]) {
+    // The current depth-only orthographic draw renders the sun shadowmap atlas.
+    sun_shadow_atlas_rt_ = rts[0];
+  }
+}
+
+void VulkanRenderTargetCache::NoteSceneColorDepthRenderTargets() {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return;
+  }
+  SunShadowFrameReset();
+  RenderTarget* const* rts = last_update_accumulated_render_targets();
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    RenderTarget* rt = rts[1 + i];
+    if (rt && rt->key().GetColorFormat() == xenos::ColorRenderTargetFormat::k_16_16_16_16) {
+      sun_shadow_scene_color_rt_ = rt;
+      if (rts[0]) {
+        sun_shadow_scene_depth_rt_ = rts[0];
+      }
+      if (last_update_framebuffer_) {
+        sun_shadow_scene_extent_ = last_update_framebuffer_->host_extent;
+      }
+      break;
+    }
+  }
+}
+
+int VulkanRenderTargetCache::ClassifyCurrentDrawForSunShadow() const {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return 0;
+  }
+  RenderTarget* const* rts = last_update_accumulated_render_targets();
+  bool any_color = false;
+  bool hdr_color = false;
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    RenderTarget* rt = rts[1 + i];
+    if (!rt) {
+      continue;
+    }
+    any_color = true;
+    // Main scene HDR target: any 64bpp color (k_16_16_16_16 or its FLOAT variant).
+    if (xenos::IsColorRenderTargetFormat64bpp(rt->key().GetColorFormat())) {
+      hdr_color = true;
+    }
+  }
+
+  // Diagnostic (sun_shadow_debug): dump the bound RT formats for the 3D world draws (color + depth;
+  // skips the depth-less UI/post passes that were dominating the dump), continuously every ~300
+  // frames, to identify the actual scene color target.
+  if (REXCVAR_GET(sun_shadow_debug) && any_color && rts[0]) {
+    static uint64_t dbg_window = ~0ull;
+    static uint32_t dbg_n = 0;
+    const uint64_t w = command_processor_.GetCurrentFrame() / 300;
+    if (w != dbg_window) {
+      dbg_window = w;
+      dbg_n = 0;
+    }
+    if (dbg_n++ < 3) {
+      if (std::FILE* f = std::fopen("/tmp/mw2_sunshadow.txt", "a")) {
+        std::fprintf(f, "RT f=%llu depth=%s w=%u",
+                     static_cast<unsigned long long>(command_processor_.GetCurrentFrame()),
+                     rts[0] ? xenos::GetDepthRenderTargetFormatName(rts[0]->key().GetDepthFormat())
+                            : "none",
+                     rts[0] ? rts[0]->key().GetWidth() : 0u);
+        for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+          if (rts[1 + i]) {
+            std::fprintf(f, " | color%u=%s w=%u", i,
+                         xenos::GetColorRenderTargetFormatName(rts[1 + i]->key().GetColorFormat()),
+                         rts[1 + i]->key().GetWidth());
+          }
+        }
+        std::fprintf(f, "\n");
+        std::fclose(f);
+      }
+    }
+  }
+
+  if (hdr_color) {
+    return 1;  // main scene (HDR color bound)
+  }
+  // Depth-only into the narrow tall sun shadowmap atlas (width well under a scene target).
+  if (!any_color && rts[0] && rts[0]->key().GetWidth() <= 768) {
+    return 2;
+  }
+  return 0;
+}
+
+bool VulkanRenderTargetCache::PrepareSunShadowReproject(SunShadowReprojectInputs& out) {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  SunShadowFrameReset();
+  if (!sun_shadow_scene_color_rt_ || !sun_shadow_scene_depth_rt_ || !sun_shadow_atlas_rt_ ||
+      !sun_shadow_scene_extent_.width || !sun_shadow_scene_extent_.height) {
+    return false;
+  }
+
+  // Transition the two depth render targets to shader-read so the pass can sample them. Leaving them
+  // in shader-read afterwards is fine: the resolve's DumpRenderTargets re-transitions from
+  // current_layout(). The scene color RT stays a color attachment (the pass writes it via blend).
+  auto to_sampled = [&](VulkanRenderTarget* rt) {
+    if (rt->current_layout() == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+      return;
+    }
+    VkImageSubresourceRange range = ui::vulkan::util::InitializeSubresourceRange(
+        VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+    command_processor_.PushImageMemoryBarrier(
+        rt->image(), range, rt->current_stage_mask(), VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        rt->current_access_mask(), VK_ACCESS_SHADER_READ_BIT, rt->current_layout(),
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    rt->SetUsage(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  };
+  auto* scene_color = static_cast<VulkanRenderTarget*>(sun_shadow_scene_color_rt_);
+  auto* scene_depth = static_cast<VulkanRenderTarget*>(sun_shadow_scene_depth_rt_);
+  auto* atlas = static_cast<VulkanRenderTarget*>(sun_shadow_atlas_rt_);
+  to_sampled(scene_depth);
+  to_sampled(atlas);
+
+  // Ensure the scene color RT is a writable color attachment for the blend pass.
+  if (scene_color->current_layout() != VulkanRenderTarget::kColorDrawLayout) {
+    VkImageSubresourceRange range =
+        ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
+    command_processor_.PushImageMemoryBarrier(
+        scene_color->image(), range, scene_color->current_stage_mask(),
+        VulkanRenderTarget::kColorDrawStageMask, scene_color->current_access_mask(),
+        VulkanRenderTarget::kColorDrawAccessMask, scene_color->current_layout(),
+        VulkanRenderTarget::kColorDrawLayout);
+    scene_color->SetUsage(VulkanRenderTarget::kColorDrawStageMask,
+                          VulkanRenderTarget::kColorDrawAccessMask,
+                          VulkanRenderTarget::kColorDrawLayout);
+  }
+
+  out.scene_color_view = scene_color->view_depth_color();
+  out.scene_depth_view = scene_depth->view_depth_color();
+  out.atlas_view = atlas->view_depth_color();
+  out.extent = sun_shadow_scene_extent_;
+  out.msaa_samples = scene_color->key().msaa_samples;
+  out.scene_color_format = GetColorVulkanFormat(scene_color->key().GetColorFormat());
+  return true;
 }
 
 VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassKey key) {

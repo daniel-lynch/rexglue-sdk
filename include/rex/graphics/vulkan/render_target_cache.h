@@ -126,11 +126,39 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                                          VkRenderingAttachmentInfo* depth_attachment,
                                          VkRenderingAttachmentInfo* stencil_attachment) const;
 
+  // IW4 sun-shadow reproject (Track A). The command processor classifies the current draw by its VS
+  // projection matrix (the rt cache can't see it) and calls these to record the render targets the
+  // screen-space sun-shadow pass needs: the sun shadowmap atlas (orthographic, depth-only draw) and
+  // the main scene color+depth (the perspective draws into the k_16_16_16_16 HDR target). The pass
+  // itself runs at the scene-color resolve. See CaptureSunShadowMatrices / sun_shadow_reproject.
+  void NoteSunShadowDepthRenderTarget();
+  void NoteSceneColorDepthRenderTargets();
+  // Classify the current draw's render target for sun-shadow capture (RT signature is reliable where
+  // depth-only-vs-pixel-shader is not — alpha shadow casters have a pixel shader): returns 1 = main
+  // scene (a k_16_16_16_16 HDR color target is bound), 2 = sun shadowmap build (depth-only into the
+  // narrow tall atlas, width < scene), 0 = neither.
+  int ClassifyCurrentDrawForSunShadow() const;
+
   // Number of draws this guest frame that bound a depth render target. The in-game world renders
   // hundreds; the frontend/title (even with its animated cloud background) renders only a handful,
   // so the command processor thresholds this to gate the display grade to in-game (the grade should
   // not wash the menus/title). Reset at each frame boundary.
   uint32_t DepthDrawCountThisFrame() const { return depth_draws_this_frame_; }
+
+  // Views/extent for the screen-space sun-shadow pass the command processor runs. view_depth_color()
+  // is the color attachment for the scene color RT and a depth-aspect *sampled* view for the depth
+  // RTs (see VulkanRenderTarget view creation).
+  struct SunShadowReprojectInputs {
+    VkImageView scene_color_view = VK_NULL_HANDLE;  // k_16_16_16_16 HDR, color attachment (LOAD)
+    VkImageView scene_depth_view = VK_NULL_HANDLE;  // scene depth, sampled (multisampled)
+    VkImageView atlas_view = VK_NULL_HANDLE;         // sun shadowmap depth, sampled (1x)
+    VkExtent2D extent = {};
+    xenos::MsaaSamples msaa_samples = xenos::MsaaSamples::k1X;  // scene color/depth sample count
+    VkFormat scene_color_format = VK_FORMAT_UNDEFINED;          // for the pipeline rendering info
+  };
+  // If the reproject is enabled and all three RTs were recorded this frame, transitions the depth
+  // RTs to shader-read, fills `out`, and returns true. The command processor then runs the pass.
+  bool PrepareSunShadowReproject(SunShadowReprojectInputs& out);
 
   // Using R16G16[B16A16]_SNORM, which are -1...1, not the needed -32...32.
   // Persistent data doesn't depend on this, so can be overriden by per-game
@@ -295,6 +323,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   const RenderTarget* const*
       last_update_framebuffer_attachments_[1 + xenos::kMaxColorRenderTargets] = {};
   const Framebuffer* last_update_framebuffer_ = VK_NULL_HANDLE;
+
+  // IW4 sun-shadow reproject (Track A). RTs recorded this frame by the NoteSun*/NoteScene* hooks.
+  // The pass itself (pipeline + draw) lives in the command processor (where the GLSL compiler is);
+  // the rt cache only owns these render targets, so it provides the views/extent and does the layout
+  // transitions via PrepareSunShadowReproject. Reset each frame via sun_shadow_frame_.
+  // Stored as the base RenderTarget* (the VulkanRenderTarget subclass is defined in the .cpp);
+  // static_cast at use sites in the .cpp.
+  RenderTarget* sun_shadow_scene_color_rt_ = nullptr;
+  RenderTarget* sun_shadow_scene_depth_rt_ = nullptr;
+  RenderTarget* sun_shadow_atlas_rt_ = nullptr;
+  VkExtent2D sun_shadow_scene_extent_ = {};
+  uint64_t sun_shadow_frame_ = 0;
+  // Resets the per-frame recorded RTs when the guest frame advances.
+  void SunShadowFrameReset();
 
   // In-game detection for gating the display grade (see DepthDrawCountThisFrame).
   uint32_t depth_draws_this_frame_ = 0;

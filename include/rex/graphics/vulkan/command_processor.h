@@ -170,6 +170,19 @@ class VulkanCommandProcessor : public CommandProcessor {
                         VkPipelineStageFlags wait_stage_mask);
 
   uint64_t GetCurrentFrame() const { return frame_current_; }
+
+  // IW4 sun-shadow reproject (Track A): the scene/sun view-proj matrices captured this frame (see
+  // CaptureSunShadowMatrices). Returns false unless both are valid. Used by the render target cache
+  // to run the screen-space reproject at the scene-color resolve. Matrices are row-major as stored
+  // in the guest constant buffer (4 consecutive c# registers).
+  bool GetSunShadowMatrices(float scene_vp_out[16], float sun_vp_out[16]) const {
+    if (!sun_shadow_scene_vp_valid_ || !sun_shadow_sun_vp_valid_) {
+      return false;
+    }
+    std::memcpy(scene_vp_out, sun_shadow_scene_vp_, sizeof(float) * 16);
+    std::memcpy(sun_vp_out, sun_shadow_sun_vp_, sizeof(float) * 16);
+    return true;
+  }
   uint64_t GetCompletedFrame() const { return frame_completed_; }
 
   // Submission must be open to insert barriers. If no pipeline stages access
@@ -539,6 +552,23 @@ class VulkanCommandProcessor : public CommandProcessor {
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
   bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
+  // IW4 sun-shadow reproject (Track A): scan the draw's VS float constants for a 4x4 projection
+  // matrix and stash it as the scene (perspective) or sun (orthographic, depth-only draw) view-proj
+  // for the screen-space sun-shadow pass. No-op unless sun_shadow_reproject != 1.0. See the cvar.
+  void CaptureSunShadowMatrices(const VulkanShader* vertex_shader);
+
+ public:
+  // IW4 sun-shadow reproject (Track A): runs the screen-space sun-shadow multiply into the scene
+  // color RT. Called by the render target cache at the scene-color resolve (which owns the RTs).
+  // No-op unless enabled, the matrices were captured, and all inputs are recorded this frame.
+  void MaybeReprojectSunShadow();
+
+ private:
+  // Lazily (re)build the reproject pipeline/layout/sampler for the given color format + sample count.
+  bool EnsureSunShadowPipeline(VkFormat color_format, xenos::MsaaSamples msaa_samples);
+  // Runs the fullscreen multiply draw (the GPU half of MaybeReprojectSunShadow).
+  void DrawSunShadowReproject(const VulkanRenderTargetCache::SunShadowReprojectInputs& inputs,
+                              const float scene_vp[16], const float sun_vp[16]);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,
@@ -587,6 +617,34 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t frame_completed_ = 0;
   // Submission indices of frames that have already been submitted.
   uint64_t closed_frame_submissions_[kMaxFramesInFlight] = {};
+
+  // IW4 sun-shadow reproject (dark-scene Track A): the scene and sun view-proj matrices captured
+  // from guest VS float constants at draw time (see CaptureSunShadowMatrices). Row-major as stored
+  // in the constant buffer (4 consecutive c# registers). Valid flags reset each frame; the reproject
+  // pass (in the render target cache) only runs when both are valid.
+  float sun_shadow_scene_vp_[16] = {};  // world -> clip (scene camera), perspective
+  float sun_shadow_sun_vp_[16] = {};    // world -> clip (sun), orthographic
+  bool sun_shadow_scene_vp_valid_ = false;
+  bool sun_shadow_sun_vp_valid_ = false;
+  uint64_t sun_shadow_capture_frame_ = 0;  // resets the valid flags at each frame boundary
+  // Diagnostic dump re-arm (sun_shadow_debug): re-samples a few draws each epoch so in-game (not
+  // just menu) matrices get dumped to /tmp/mw2_sunshadow.txt.
+  uint64_t sun_shadow_dump_epoch_ = ~0ull;
+  uint32_t sun_shadow_dump_depth_n_ = 0;
+  uint32_t sun_shadow_dump_scene_n_ = 0;
+  // The reproject pass: lazily-built fullscreen multiply pipeline (rebuilt if the scene sample count
+  // changes), run once per frame at the scene-color resolve.
+  VkDescriptorSetLayout sun_shadow_descriptor_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout sun_shadow_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline sun_shadow_pipeline_ = VK_NULL_HANDLE;
+  VkSampler sun_shadow_sampler_ = VK_NULL_HANDLE;
+  VkDescriptorPool sun_shadow_descriptor_pool_ = VK_NULL_HANDLE;
+  static constexpr uint32_t kSunShadowDescriptorRing = 4;  // > frames in flight
+  VkDescriptorSet sun_shadow_descriptor_sets_[kSunShadowDescriptorRing] = {};
+  VkFormat sun_shadow_pipeline_color_format_ = VK_FORMAT_UNDEFINED;
+  xenos::MsaaSamples sun_shadow_pipeline_samples_ = xenos::MsaaSamples::k1X;
+  bool sun_shadow_pipeline_failed_ = false;
+  uint64_t sun_shadow_reproject_frame_ = 0;  // once-per-frame guard for the pass
 
   // <Submission where last used, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, VkDeviceMemory>> destroy_memory_;
