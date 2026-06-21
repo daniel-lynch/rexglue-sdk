@@ -8218,10 +8218,19 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
               &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
               sizeof(float) * 4);
           if (apply_fog_density) {
+            // PERF: compare against the CACHED register file, not the just-written `mapping`. The
+            // uniform-buffer pool is host-visible WRITE-COMBINED memory: writes are buffered
+            // (cheap) but reads are uncached (~100ns each). Reading dst[k] back per VS constant
+            // cost ~30ms/frame in skinned scenes (hundreds of bone constants × thousands of
+            // draws) — it was the dominant UpdateBindings cost (~50% of the frame). Read the
+            // source from regs (cached) and only WRITE to the mapping on the rare
+            // log2(e)=1.442695 fog-coefficient match.
+            const float* src = reinterpret_cast<const float*>(
+                &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)]);
             float* dst = reinterpret_cast<float*>(mapping);
             for (int k = 0; k < 4; ++k) {
-              if (std::fabs(dst[k] - 1.442695f) < 0.01f) {
-                dst[k] *= kFogDensityScale;
+              if (std::fabs(src[k] - 1.442695f) < 0.01f) {
+                dst[k] = src[k] * kFogDensityScale;
               }
             }
           }
