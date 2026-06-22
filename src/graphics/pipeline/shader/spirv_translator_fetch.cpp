@@ -18,9 +18,26 @@
 #include <SPIRV/GLSL.std.450.h>
 #include <fmt/format.h>
 
+#include <cstdlib>
+
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
+
+// [BO-LUTGRID-FIX] Black Ops "flat/grid skinned models": a 3D color-grading LUT
+// (stored as a 2D atlas, dimension k3DOrStacked) is sampled with computed-LOD
+// gradients of a coordinate that is the per-pixel scene COLOR. A per-pixel color
+// has no screen-space coherence, so its coarse derivative is high-frequency
+// per-quad noise -> per-quad mip / anisotropic-footprint selection -> a 2px chroma
+// checkerboard that gets amplified into the lighting. 3D LUTs have no meaningful
+// mips, so force the explicit-LOD path (which also disables anisotropic filtering)
+// for k3DOrStacked texture fetches. See docs/research/flatmodel-ROOTCAUSE-FOUND.md
+// in the blackops-recomp repo for the full root-cause trail and the RenderDoc proof.
+REXCVAR_DEFINE_BOOL(fetch_3d_lut_force_explicit_lod, true, "GPU/Shader",
+                    "Sample 3D/stacked textures (color-grading LUTs) at explicit "
+                    "LOD instead of computed-LOD gradients, fixing a 2px grid on "
+                    "lit surfaces (Black Ops flat/grid skinned models).");
 
 namespace rex::graphics {
 
@@ -578,6 +595,16 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     // Whether to use gradients (implicit or explicit) for LOD calculation.
     bool use_computed_lod = instr.attributes.use_computed_lod &&
                             (is_pixel_shader() || instr.attributes.use_register_gradients);
+    // [BO-LUTGRID-FIX] Force the explicit-LOD (mip 0 / fetch-const LOD) path for
+    // 3D/stacked color-grading LUT fetches to kill the per-quad gradient grid.
+    // BO_LUT_GRID=1 restores the original gridded behavior for A/B comparison.
+    if (use_computed_lod && instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+        instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
+      static const bool kForceGrid = std::getenv("BO_LUT_GRID") != nullptr;
+      if (REXCVAR_GET(fetch_3d_lut_force_explicit_lod) && !kForceGrid) {
+        use_computed_lod = false;
+      }
+    }
     if (instr.opcode == ucode::FetchOpcode::kGetTextureComputedLod &&
         (!use_computed_lod || instr.attributes.use_register_gradients)) {
       assert_always();
