@@ -69,7 +69,7 @@ REXCVAR_DEFINE_BOOL(readback_memexport_fast, true, "GPU",
                     "automatic fallback to full synchronous readback")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(readback_deferred, true, "GPU",
+REXCVAR_DEFINE_BOOL(readback_deferred, false, "GPU",
                     "Apply memexport and occlusion-query GPU->CPU readbacks without blocking "
                     "the command processor on a full GPU drain. Results are scattered back to "
                     "guest RAM 1-2 frames late from a pooled, submission-tracked buffer ring. "
