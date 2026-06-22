@@ -282,6 +282,17 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
           println("\t\treturn;");
           println("\t}}");
         }
+      } else if (const auto* targetFn = graph().getFunction(target)) {
+        // No pre-resolved call edge for this site, but the target IS a known function
+        // entry (classifyTarget only returns Function/Import when isEntryPoint(target)).
+        // This happens when overlapping functions / config chunks share a loop: a
+        // conditional back-branch in one body targets a sibling/parent entry that the
+        // analyzer never recorded as a tail-call edge for this site. Emit the tail call
+        // directly to that entry rather than aborting.
+        println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
+        println("\t\t{}(ctx, base);", targetFn->name());
+        println("\t\treturn;");
+        println("\t}}");
       } else {
         REXCODEGEN_ERROR("Unresolved conditional branch to 0x{:08X} from 0x{:08X} (no CallTarget)",
                          target, base);

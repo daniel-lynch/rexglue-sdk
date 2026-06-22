@@ -140,6 +140,27 @@ bool build_bctr(BuilderContext& ctx) {
     }
   }
 
+  // A "jump table" whose entries are all null was never statically resolved — this is a
+  // runtime-populated function-pointer / vtable dispatch, not a real switch. Emitting a
+  // switch of all-__builtin_trap() cases would abort at runtime the moment the dispatch is
+  // taken. Treat it as an indirect tail-call via CTR instead (the no-table path below).
+  if (jt && !jt->targets.empty()) {
+    bool allNull = true;
+    for (uint32_t t : jt->targets) {
+      if (t != 0) {
+        allNull = false;
+        break;
+      }
+    }
+    if (allNull) {
+      REXCODEGEN_TRACE(
+          "bctr 0x{:08X}: jump table has {} entries, all null -> runtime vtable dispatch, "
+          "emitting indirect tail-call",
+          ctx.base, jt->targets.size());
+      jt = nullptr;
+    }
+  }
+
   if (jt) {
     ctx.println("\tswitch ({}.u32) {{", ctx.r(jt->indexRegister));
 

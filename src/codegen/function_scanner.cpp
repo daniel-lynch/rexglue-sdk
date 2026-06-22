@@ -1360,6 +1360,16 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
 //=============================================================================
 // Jump Table Detection
 //=============================================================================
+// KNOWN BUG (TODO): the backward index-register trace below mis-identifies the index register
+// when the indexed load reuses its destination as the (scaled) index operand, e.g.
+// `lwzx r0, r12, r0` (RT == RB). Then `ctrSourceReg` (followed for kComputed offset chains) and
+// `indexReg` (followed for slwi index scaling) both track the same register, and the scaling
+// `rlwinm rX, rIdx, 2` is consumed by the wrong trace, so the real index register (rIdx) is never
+// recovered -- the emitted switch keys on the wrong register. Observed on CoD4/IW3 sub_821AE3D8
+// (the script lexer's token dispatch, bctr 0x821AE640: indexed by r10 but detected as r7), which
+// mis-tokenized and produced a GSC "bad syntax" error. Worked around there with a manual
+// [[switch_tables]] override (address+register+labels). A proper fix would disambiguate the two
+// backward traces when load dest == index operand. The mw2/blackops ports may hit this too.
 std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAddr,
                                          const CodeRegion& containingRegion, uint32_t funcStart,
                                          uint32_t funcEnd) {
