@@ -563,12 +563,25 @@ class VulkanCommandProcessor : public CommandProcessor {
   // No-op unless enabled, the matrices were captured, and all inputs are recorded this frame.
   void MaybeReprojectSunShadow();
 
+  // IW4 scene shadow lift (dark-scene §11): adds a luminance-gated low-end lift to the HDR scene
+  // color RT in place, before it is dumped/resolved. Called by the render target cache at the
+  // scene-color resolve. No-op unless scene_shadow_lift != 0 and the scene-color RT is recorded.
+  void MaybeApplySceneShadowLift();
+
  private:
   // Lazily (re)build the reproject pipeline/layout/sampler for the given color format + sample count.
   bool EnsureSunShadowPipeline(VkFormat color_format, xenos::MsaaSamples msaa_samples);
   // Runs the fullscreen multiply draw (the GPU half of MaybeReprojectSunShadow).
   void DrawSunShadowReproject(const VulkanRenderTargetCache::SunShadowReprojectInputs& inputs,
                               const float scene_vp[16], const float sun_vp[16]);
+  // Lazily (re)build the scene-shadow-lift pipeline/layout/sampler for the given color format. The
+  // shader is a single sampled-image -> color-attachment copy+lift selected by a push constant.
+  bool EnsureSceneLiftPipeline(VkFormat color_format);
+  // Lazily (re)create the scratch image the lift bounces the scene color through (same
+  // format/extent).
+  bool EnsureSceneLiftScratch(VkFormat color_format, VkExtent2D extent);
+  // Runs the two fullscreen draws (copy scene->scratch, then lift scratch->scene).
+  void DrawSceneShadowLift(const VulkanRenderTargetCache::SceneColorLiftInputs& inputs);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,
@@ -628,6 +641,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool sun_shadow_scene_vp_valid_ = false;
   bool sun_shadow_sun_vp_valid_ = false;
   uint64_t sun_shadow_capture_frame_ = 0;  // resets the valid flags at each frame boundary
+  // Once-per-frame guard for recording the scene-color RT for the scene shadow lift (which needs
+  // the RT but not the reproject's matrices, so it records independently of the matrix-capture
+  // path).
+  uint64_t scene_color_record_frame_ = 0;
   // Diagnostic dump re-arm (sun_shadow_debug): re-samples a few draws each epoch so in-game (not
   // just menu) matrices get dumped to /tmp/mw2_sunshadow.txt.
   uint64_t sun_shadow_dump_epoch_ = ~0ull;
@@ -646,6 +663,28 @@ class VulkanCommandProcessor : public CommandProcessor {
   xenos::MsaaSamples sun_shadow_pipeline_samples_ = xenos::MsaaSamples::k1X;
   bool sun_shadow_pipeline_failed_ = false;
   uint64_t sun_shadow_reproject_frame_ = 0;  // once-per-frame guard for the pass
+
+  // IW4 scene shadow lift (dark-scene §11): a lazily-built fullscreen copy+lift pipeline run once
+  // per frame at the scene-color resolve. Bounces the scene color through a scratch image (the
+  // scene RT has no TRANSFER usage and a draw cannot read the attachment it writes), so pass 1
+  // copies the scene color into the scratch and pass 2 samples the scratch and writes the lifted
+  // scene color.
+  VkDescriptorSetLayout scene_lift_descriptor_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout scene_lift_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline scene_lift_pipeline_ = VK_NULL_HANDLE;
+  VkSampler scene_lift_sampler_ = VK_NULL_HANDLE;
+  VkDescriptorPool scene_lift_descriptor_pool_ = VK_NULL_HANDLE;
+  static constexpr uint32_t kSceneLiftDescriptorRing = 8;  // 2 passes/frame * > frames in flight
+  VkDescriptorSet scene_lift_descriptor_sets_[kSceneLiftDescriptorRing] = {};
+  uint32_t scene_lift_descriptor_next_ = 0;
+  VkFormat scene_lift_pipeline_color_format_ = VK_FORMAT_UNDEFINED;
+  bool scene_lift_pipeline_failed_ = false;
+  VkImage scene_lift_scratch_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory scene_lift_scratch_memory_ = VK_NULL_HANDLE;
+  VkImageView scene_lift_scratch_view_ = VK_NULL_HANDLE;
+  VkFormat scene_lift_scratch_format_ = VK_FORMAT_UNDEFINED;
+  VkExtent2D scene_lift_scratch_extent_ = {};
+  uint64_t scene_lift_frame_ = 0;  // once-per-frame guard for the pass
 
   // <Submission where last used, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, VkDeviceMemory>> destroy_memory_;

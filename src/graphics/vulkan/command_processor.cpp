@@ -72,6 +72,20 @@ REXCVAR_DEFINE_BOOL(bloom_sanitize, true, "GPU/Vulkan",
                     "Zero NaN/Inf/negative fp16 bloom samples in the readback resolve (fixes a "
                     "white-screen race in titles whose composite re-reads the bloom from RAM)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// bloom_sanitize zeroes NaN/Inf/negative, but the residual intermittent white flash is a stale
+// bloom tile read before write that contains a *finite, positive, blown* sample (the exp_bias=5
+// 32x HDR scale applied to garbage) which sanitize passes straight through. A correct frame's
+// bloom tiles are ~0, so clamping any bloom sample whose magnitude exceeds a sane HDR ceiling only
+// fires on blown samples and neutralizes the flash regardless of the underlying timing race.
+REXCVAR_DEFINE_BOOL(bloom_clamp, false, "GPU/Vulkan",
+                    "Detect a mass bloom blow-out (stale-tile race: an abnormal fraction of bloom "
+                    "samples are blown) and zero the bloom that frame. Validated deterministically "
+                    "but not yet matched to a real in-game flash; experimental, default-off.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(bloom_clamp_blown_pct, 25, "GPU/Vulkan",
+                     "Percent of finite bloom samples above ~64.0 that marks a frame as a blown "
+                     "stale-tile read (above this the whole bloom is zeroed)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
@@ -193,6 +207,51 @@ REXCVAR_DEFINE_DOUBLE(sun_shadow_compare, 1.0, "GPU/Vulkan",
                       "Sun-shadow depth-compare sign (+1 or -1; flip if the heatmap is inverted)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// IW4 SCENE SHADOW LIFT (dark-scene §11 — the "low-end shadow lift" true-fix axis). The single root
+// of the dark-scene/blowout pair is the dropped indirect/ambient HDR scale: the Pit's shadowed
+// indirect reads too dark, AND outdoors the dark average drags the guest auto-exposure into
+// over-exposing. Offline RE (lighting-hdr-scale-re-campaign §10.6) proved there is no separable
+// guest post pass to fix; the exposure is baked into the EDRAM scene draws. This restores the
+// missing indirect FLOOR by adding a luminance-gated lift to the HDR scene color RT *in place,
+// before* it is dumped/resolved — so it feeds BOTH the visible scene and the (downstream) auto-
+// exposure luminance the guest reads back, lifting the Pit while letting the AE stop overshooting
+// outdoors. A LOW-END (shadow) lift, not a uniform multiply: a uniform ×N re-blows highlights and a
+// cool-ambient multiply cyan-casts (the s21 dead end); lifting only the low end toward a neutral
+// fill adds the floor without touching the correctly-exposed sunlit values. Per-pixel op (hue
+// preserved by lifting toward fill_rgb, default neutral):
+//   out = in + lift * (1 - smoothstep(0, knee, luma(in))) * fill_rgb
+// Implemented as two fullscreen draws at the scene-color resolve (copy the scene color to a
+// scratch, then sample+lift back) because the scene RT has no TRANSFER usage and a draw cannot read
+// the attachment it writes. Binary/map-agnostic (the scene-color RT is identified by signature,
+// same as the sun-shadow reproject) so it covers SP + MP. 0.0 = off (no pass, zero overhead).
+// Hot-reloadable.
+REXCVAR_DEFINE_DOUBLE(scene_shadow_lift, 0.0, "GPU/Vulkan",
+                      "Low-end lift added to the HDR scene color before resolve to restore the "
+                      "missing indirect floor (0 = off; ~0.02-0.1 typical)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(scene_shadow_knee, 0.25, "GPU/Vulkan",
+                      "Luma knee for scene_shadow_lift: pixels brighter than this get no lift "
+                      "(smoothstep 0->knee), so only shadows/indirect are floored")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(scene_shadow_fill_r, 1.0, "GPU/Vulkan",
+                      "Red component of the scene_shadow_lift fill color (1,1,1 = neutral floor)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(scene_shadow_fill_g, 1.0, "GPU/Vulkan",
+                      "Green component of the scene_shadow_lift fill color (1,1,1 = neutral floor)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(scene_shadow_fill_b, 1.0, "GPU/Vulkan",
+                      "Blue component of the scene_shadow_lift fill color (1,1,1 = neutral floor)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// PARKED experiment toggle: route scene_shadow_lift through the in-place scene-color-RT pass
+// (MaybeApplySceneShadowLift) instead of the display-grade ramp. Default off because that pass's
+// write does not reach the displayed frame in the Pit (the swap re-resolves from guest RAM off a
+// different EDRAM base; see lighting-hdr-scale-re-campaign §12). The working lift is in the grade
+// ramp. Kept for a future true pre-resolve / pre-auto-exposure attempt.
+REXCVAR_DEFINE_INT32(scene_shadow_lift_scenebuf, 0, "GPU/Vulkan",
+                     "PARKED: apply scene_shadow_lift in the scene-color-RT pass (0 = off, use the "
+                     "display-grade ramp instead)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // ---- Live-tuning harness (dark-scene work)
 // ------------------------------------------------------- When `live_tune_file` is a non-empty
 // path, IssueSwap polls that file once per frame and, on mtime change, re-applies it via
@@ -254,13 +313,21 @@ struct DisplayGrade {
   float tint[3] = {1.0f, 1.0f, 1.0f};
   float gamma = 1.0f;
   float tonemap_white = 0.0f;  // extended-Reinhard white point; 0 = off
+  // Additive low-end lift (dark-scene §12): restores the crushed indirect/shadow floor that the
+  // multiplicative/pow grade terms can't lift (pow of ~0 is still ~0). Applied as a per-channel
+  // output floor, tapered to 0 above shadow_knee so only shadows/indirect get the fill.
+  float shadow_lift = 0.0f;
+  float shadow_knee = 0.25f;
+  float fill[3] = {1.0f, 1.0f, 1.0f};
   bool active() const {
     return exposure != 1.0f || gamma != 1.0f || tonemap_white != 0.0f || tint[0] != 1.0f ||
-           tint[1] != 1.0f || tint[2] != 1.0f;
+           tint[1] != 1.0f || tint[2] != 1.0f || shadow_lift != 0.0f;
   }
   bool operator==(const DisplayGrade& o) const {
     return exposure == o.exposure && gamma == o.gamma && tonemap_white == o.tonemap_white &&
-           tint[0] == o.tint[0] && tint[1] == o.tint[1] && tint[2] == o.tint[2];
+           tint[0] == o.tint[0] && tint[1] == o.tint[1] && tint[2] == o.tint[2] &&
+           shadow_lift == o.shadow_lift && shadow_knee == o.shadow_knee && fill[0] == o.fill[0] &&
+           fill[1] == o.fill[1] && fill[2] == o.fill[2];
   }
 };
 
@@ -272,6 +339,11 @@ DisplayGrade QueryDisplayGrade() {
   g.tint[2] = float(REXCVAR_GET(scene_tint_b));
   g.gamma = float(REXCVAR_GET(scene_gamma));
   g.tonemap_white = float(REXCVAR_GET(scene_tonemap_white));
+  g.shadow_lift = float(REXCVAR_GET(scene_shadow_lift));
+  g.shadow_knee = float(REXCVAR_GET(scene_shadow_knee));
+  g.fill[0] = float(REXCVAR_GET(scene_shadow_fill_r));
+  g.fill[1] = float(REXCVAR_GET(scene_shadow_fill_g));
+  g.fill[2] = float(REXCVAR_GET(scene_shadow_fill_b));
   return g;
 }
 
@@ -293,6 +365,22 @@ inline float GradeChannel(const DisplayGrade& g, float v, int channel) {
   }
   if (g.gamma != 1.0f) {
     v = std::pow(v, g.gamma);
+  }
+  // Additive low-end output floor: lift crushed darks toward the fill color, tapering to 0 above
+  // the knee (1 - smoothstep(0, knee, v)) so sunlit/midtone values are untouched. This is what
+  // restores the IW4 indirect floor the reference shows on lightmapped shadow geometry (the
+  // mult/pow terms above can't: pow(~0) stays ~0). Per-channel; neutral fill = a grey floor.
+  if (g.shadow_lift > 0.0f) {
+    const float k = g.shadow_knee > 1e-4f ? g.shadow_knee : 1e-4f;
+    float t = v / k;
+    if (t > 1.0f) {
+      t = 1.0f;
+    }
+    const float mask = 1.0f - (t * t * (3.0f - 2.0f * t));  // 1 - smoothstep(0, knee, v)
+    v += g.shadow_lift * mask * g.fill[channel];
+    if (v > 1.0f) {
+      v = 1.0f;
+    }
   }
   return v;
 }
@@ -2418,6 +2506,19 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          sun_shadow_descriptor_pool_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroySampler, device, sun_shadow_sampler_);
 
+  // Scene shadow lift (§11) resources (descriptor sets are freed with the pool).
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, scene_lift_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         scene_lift_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         scene_lift_descriptor_set_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         scene_lift_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroySampler, device, scene_lift_sampler_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, scene_lift_scratch_view_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, scene_lift_scratch_image_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, scene_lift_scratch_memory_);
+
   for (auto& readback_pair : readback_buffers_) {
     ReadbackBuffer& readback = readback_pair.second;
     for (uint32_t i = 0; i < 2; ++i) {
@@ -2830,14 +2931,19 @@ void VulkanCommandProcessor::MaybeApplyLiveTune() {
   // Data dump — current value of every tuning knob.
   REXGPU_WARN(
       "[MW2-TUNE] applied '{}' | ambient={} fog={} fogdensity={} bloom={} lightmap={} model={} "
-      "sky_cube={} | exposure={} gamma={} tonemap_white={} sat={} tint=({},{},{})",
+      "sky_cube={} | exposure={} gamma={} tonemap_white={} sat={} tint=({},{},{}) | "
+      "shadow_lift={} knee={} fill=({},{},{})",
       tune_file, rex::cvar::Query<double>("lightprobe_ambient_scale"),
       rex::cvar::Query<double>("fog_color_scale"), rex::cvar::Query<double>("fog_density_scale"),
       rex::cvar::Query<double>("bloom_intensity_scale"), new_lightmap, new_model, new_sky_cube,
       rex::cvar::Query<double>("scene_exposure"), rex::cvar::Query<double>("scene_gamma"),
       rex::cvar::Query<double>("scene_tonemap_white"), rex::cvar::Query<double>("scene_saturation"),
       rex::cvar::Query<double>("scene_tint_r"), rex::cvar::Query<double>("scene_tint_g"),
-      rex::cvar::Query<double>("scene_tint_b"));
+      rex::cvar::Query<double>("scene_tint_b"), rex::cvar::Query<double>("scene_shadow_lift"),
+      rex::cvar::Query<double>("scene_shadow_knee"),
+      rex::cvar::Query<double>("scene_shadow_fill_r"),
+      rex::cvar::Query<double>("scene_shadow_fill_g"),
+      rex::cvar::Query<double>("scene_shadow_fill_b"));
 }
 
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
@@ -5746,6 +5852,28 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
         reg::RB_COPY_DEST_INFO copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
         const FormatInfo* format_info = FormatInfo::Get(uint32_t(copy_dest_info.copy_dest_format));
         if (format_info && format_info->bits_per_pixel == 64 && written_length < (2u << 20)) {
+          // Detect a mass bloom blow-out (stale-tile race). Normal frames have only a small fraction
+          // of finite samples above ~64.0 (measured <=~8%); a flash blows most of the buffer. When
+          // the blown fraction is abnormally high the whole bloom is garbage this frame, so it is
+          // zeroed (a correct frame's bloom is ~0 anyway) - neutralizing the flash without touching
+          // normal bloom. Validated deterministically (forced full blow-out: detector ON -> scene
+          // correct, OFF -> white) but NOT yet matched to a real in-game flash, so default-off.
+          bool suppress = false;
+          if (REXCVAR_GET(bloom_clamp)) {
+            uint32_t n_fin = 0, n_blown = 0;
+            for (uint32_t off = 0; off + 2u <= written_length; off += 2u) {
+              uint16_t h;
+              std::memcpy(&h, destination + off, 2);
+              uint16_t half = __builtin_bswap16(h);
+              if ((half & 0x7C00u) == 0x7C00u) continue;             // NaN/Inf
+              if ((half & 0x8000u) && (half & 0x7FFFu)) continue;    // negative
+              ++n_fin;
+              if ((half & 0x7FFFu) > 0x5400u) ++n_blown;             // > 64.0
+            }
+            int32_t pct = REXCVAR_GET(bloom_clamp_blown_pct);
+            suppress = n_fin > 0 &&
+                       uint64_t(n_blown) * 100u >= uint64_t(n_fin) * uint64_t(uint32_t(pct));
+          }
           bool changed = false;
           for (uint32_t off = 0; off + 2u <= written_length; off += 2u) {
             uint16_t h;
@@ -5753,7 +5881,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
             uint16_t half = __builtin_bswap16(h);  // guest fp16 halfs are big-endian
             // NaN/Inf: exponent all ones. Negative: sign bit set with nonzero magnitude.
             bool bad = (half & 0x7C00u) == 0x7C00u || ((half & 0x8000u) && (half & 0x7FFFu));
-            if (bad) {
+            // On a detected mass blow-out the entire bloom this frame is stale garbage; zero it all.
+            if (bad || suppress) {
               uint16_t zero = 0;
               std::memcpy(destination + off, &zero, 2);
               changed = true;
@@ -7496,9 +7625,27 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
 }
 
 void VulkanCommandProcessor::CaptureSunShadowMatrices(const VulkanShader* vertex_shader) {
-  // No-op unless the reproject is enabled (default 1.0 = off => zero overhead in normal runs).
-  if (std::fabs(float(REXCVAR_GET(sun_shadow_reproject)) - 1.0f) < 1e-4f || !vertex_shader) {
+  // No-op unless the reproject OR the scene shadow lift is enabled (both default off => zero
+  // overhead in normal runs). The lift needs only the scene-color RT recording below, not the
+  // matrices.
+  const bool reproject_on = std::fabs(float(REXCVAR_GET(sun_shadow_reproject)) - 1.0f) >= 1e-4f;
+  // Only the PARKED scene-buffer lift needs the scene-color RT recorded; the working lift is in the
+  // display-grade ramp (no RT recording needed).
+  const bool lift_on = REXCVAR_GET(scene_shadow_lift_scenebuf) != 0 &&
+                       std::fabs(float(REXCVAR_GET(scene_shadow_lift))) > 1e-6f;
+  if ((!reproject_on && !lift_on) || !vertex_shader) {
     return;
+  }
+  // Record the scene-color RT for the lift independently of the reproject's matrix capture: the
+  // lift runs without matrices, so it can't rely on the end-of-function recording (which is gated
+  // on a fresh scene-VP capture). Once per frame on the first scene-color draw.
+  if (lift_on && render_target_cache_ && scene_color_record_frame_ != frame_current_ &&
+      render_target_cache_->ClassifyCurrentDrawForSunShadow() == 1) {
+    scene_color_record_frame_ = frame_current_;
+    render_target_cache_->NoteSceneColorDepthRenderTargets();
+  }
+  if (!reproject_on) {
+    return;  // lift-only: matrices not needed
   }
   // Frame boundary: drop last frame's captures so a frame without the sun-build pass disables the
   // reproject (a stale sun matrix would shadow the wrong pixels) rather than using old data.
@@ -8099,6 +8246,424 @@ void VulkanCommandProcessor::DrawSunShadowReproject(
                                     sizeof(pc), &pc);
   command_buffer.CmdVkDraw(3, 1, 0, 0);
   command_buffer.CmdVkEndRendering();
+}
+
+// ---- IW4 scene shadow lift (dark-scene §11) --------------------------------------------------
+
+namespace {
+// Fullscreen copy+lift fragment shader. Samples xe_src and adds a luminance-gated low-end lift:
+//   out = in + lift * (1 - smoothstep(0, knee, luma(in))) * fill
+// Pass 1 runs with lift=0 (exact passthrough copy of the scene color into the scratch); pass 2 runs
+// with the real lift, sampling the scratch and writing the scene color. Reuses kSunShadowVsSource.
+const char* kSceneLiftFsSource = R"(#version 450
+layout(location = 0) in vec2 xe_uv;
+layout(location = 0) out vec4 xe_out;
+layout(set = 0, binding = 0) uniform texture2D xe_src;
+layout(set = 0, binding = 1) uniform sampler xe_samp;
+layout(push_constant) uniform XePC {
+  vec4 p;     // x=lift, y=knee
+  vec4 fill;  // rgb=fill color
+} pc;
+void main() {
+  vec4 c = texture(sampler2D(xe_src, xe_samp), xe_uv);
+  float luma = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+  float knee = max(pc.p.y, 1e-4);
+  float shadow_mask = 1.0 - smoothstep(0.0, knee, luma);
+  vec3 lifted = c.rgb + pc.p.x * shadow_mask * pc.fill.rgb;
+  xe_out = vec4(clamp(lifted, vec3(0.0), vec3(1.0)), c.a);
+})";
+}  // namespace
+
+bool VulkanCommandProcessor::EnsureSceneLiftScratch(VkFormat color_format, VkExtent2D extent) {
+  if (!extent.width || !extent.height) {
+    return false;
+  }
+  if (scene_lift_scratch_image_ != VK_NULL_HANDLE && scene_lift_scratch_format_ == color_format &&
+      scene_lift_scratch_extent_.width == extent.width &&
+      scene_lift_scratch_extent_.height == extent.height) {
+    return true;
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  // Extent/format change is rare (the scene RT is a fixed size) -- drain and destroy immediately.
+  if (scene_lift_scratch_image_ != VK_NULL_HANDLE) {
+    AwaitAllQueueOperationsCompletion();
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device,
+                                           scene_lift_scratch_view_);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, scene_lift_scratch_image_);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, scene_lift_scratch_memory_);
+  }
+  scene_lift_scratch_format_ = VK_FORMAT_UNDEFINED;
+  scene_lift_scratch_extent_ = {};
+
+  VkImageCreateInfo image_create_info;
+  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_create_info.pNext = nullptr;
+  image_create_info.flags = 0;
+  image_create_info.imageType = VK_IMAGE_TYPE_2D;
+  image_create_info.format = color_format;
+  image_create_info.extent.width = extent.width;
+  image_create_info.extent.height = extent.height;
+  image_create_info.extent.depth = 1;
+  image_create_info.mipLevels = 1;
+  image_create_info.arrayLayers = 1;
+  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_create_info.queueFamilyIndexCount = 0;
+  image_create_info.pQueueFamilyIndices = nullptr;
+  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+          vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+          scene_lift_scratch_image_, scene_lift_scratch_memory_)) {
+    REXGPU_ERROR("[MW2-LIFT] failed to create the scene-lift scratch image");
+    return false;
+  }
+  VkImageViewCreateInfo view_info;
+  view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_info.pNext = nullptr;
+  view_info.flags = 0;
+  view_info.image = scene_lift_scratch_image_;
+  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_info.format = color_format;
+  view_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
+  if (dfn.vkCreateImageView(device, &view_info, nullptr, &scene_lift_scratch_view_) != VK_SUCCESS) {
+    REXGPU_ERROR("[MW2-LIFT] failed to create the scene-lift scratch image view");
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, scene_lift_scratch_image_);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, scene_lift_scratch_memory_);
+    return false;
+  }
+  scene_lift_scratch_format_ = color_format;
+  scene_lift_scratch_extent_ = extent;
+  return true;
+}
+
+bool VulkanCommandProcessor::EnsureSceneLiftPipeline(VkFormat color_format) {
+  if (scene_lift_pipeline_failed_) {
+    return false;
+  }
+  if (scene_lift_pipeline_ != VK_NULL_HANDLE && scene_lift_pipeline_color_format_ == color_format) {
+    return true;
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  if (scene_lift_pipeline_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipeline(device, scene_lift_pipeline_, nullptr);
+    scene_lift_pipeline_ = VK_NULL_HANDLE;
+  }
+
+  // One-time: descriptor set layout (1 sampled image + 1 sampler), pipeline layout, sampler,
+  // descriptor pool + ring of sets.
+  if (scene_lift_descriptor_set_layout_ == VK_NULL_HANDLE) {
+    VkDescriptorSetLayoutBinding bindings[2] = {};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[1] = bindings[0];
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    VkDescriptorSetLayoutCreateInfo dsl_info = {};
+    dsl_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dsl_info.bindingCount = 2;
+    dsl_info.pBindings = bindings;
+    if (dfn.vkCreateDescriptorSetLayout(device, &dsl_info, nullptr,
+                                        &scene_lift_descriptor_set_layout_) != VK_SUCCESS) {
+      scene_lift_pipeline_failed_ = true;
+      return false;
+    }
+    VkPushConstantRange pc_range = {};
+    pc_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pc_range.offset = 0;
+    pc_range.size = sizeof(float) * 8;  // 2 vec4
+    VkPipelineLayoutCreateInfo pl_info = {};
+    pl_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl_info.setLayoutCount = 1;
+    pl_info.pSetLayouts = &scene_lift_descriptor_set_layout_;
+    pl_info.pushConstantRangeCount = 1;
+    pl_info.pPushConstantRanges = &pc_range;
+    if (dfn.vkCreatePipelineLayout(device, &pl_info, nullptr, &scene_lift_pipeline_layout_) !=
+        VK_SUCCESS) {
+      scene_lift_pipeline_failed_ = true;
+      return false;
+    }
+    VkSamplerCreateInfo samp_info = {};
+    samp_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samp_info.magFilter = VK_FILTER_NEAREST;
+    samp_info.minFilter = VK_FILTER_NEAREST;
+    samp_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samp_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samp_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samp_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samp_info.maxLod = VK_LOD_CLAMP_NONE;
+    if (dfn.vkCreateSampler(device, &samp_info, nullptr, &scene_lift_sampler_) != VK_SUCCESS) {
+      scene_lift_pipeline_failed_ = true;
+      return false;
+    }
+    VkDescriptorPoolSize pool_sizes[2] = {};
+    pool_sizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    pool_sizes[0].descriptorCount = kSceneLiftDescriptorRing;
+    pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    pool_sizes[1].descriptorCount = kSceneLiftDescriptorRing;
+    VkDescriptorPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets = kSceneLiftDescriptorRing;
+    pool_info.poolSizeCount = 2;
+    pool_info.pPoolSizes = pool_sizes;
+    if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &scene_lift_descriptor_pool_) !=
+        VK_SUCCESS) {
+      scene_lift_pipeline_failed_ = true;
+      return false;
+    }
+    for (uint32_t i = 0; i < kSceneLiftDescriptorRing; ++i) {
+      VkDescriptorSetAllocateInfo set_info = {};
+      set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+      set_info.descriptorPool = scene_lift_descriptor_pool_;
+      set_info.descriptorSetCount = 1;
+      set_info.pSetLayouts = &scene_lift_descriptor_set_layout_;
+      if (dfn.vkAllocateDescriptorSets(device, &set_info, &scene_lift_descriptor_sets_[i]) !=
+          VK_SUCCESS) {
+        scene_lift_pipeline_failed_ = true;
+        return false;
+      }
+    }
+  }
+
+  std::vector<uint32_t> vs_spirv, fs_spirv;
+  std::string err;
+  if (!CompileGlslToSpirvInternal(EShLangVertex, kSunShadowVsSource, vs_spirv, err) ||
+      !CompileGlslToSpirvInternal(EShLangFragment, kSceneLiftFsSource, fs_spirv, err)) {
+    REXGPU_ERROR("[MW2-LIFT] shader compile failed: {}", err);
+    scene_lift_pipeline_failed_ = true;
+    return false;
+  }
+  VkShaderModule vs_module =
+      ui::vulkan::util::CreateShaderModule(vulkan_device, vs_spirv.data(), vs_spirv.size() * 4);
+  VkShaderModule fs_module =
+      ui::vulkan::util::CreateShaderModule(vulkan_device, fs_spirv.data(), fs_spirv.size() * 4);
+  if (vs_module == VK_NULL_HANDLE || fs_module == VK_NULL_HANDLE) {
+    if (vs_module != VK_NULL_HANDLE)
+      dfn.vkDestroyShaderModule(device, vs_module, nullptr);
+    if (fs_module != VK_NULL_HANDLE)
+      dfn.vkDestroyShaderModule(device, fs_module, nullptr);
+    scene_lift_pipeline_failed_ = true;
+    return false;
+  }
+
+  VkPipelineShaderStageCreateInfo stages[2] = {};
+  stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[0].module = vs_module;
+  stages[0].pName = "main";
+  stages[1] = stages[0];
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  stages[1].module = fs_module;
+
+  VkPipelineVertexInputStateCreateInfo vtx = {};
+  vtx.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+  VkPipelineInputAssemblyStateCreateInfo ia = {};
+  ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+  ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineViewportStateCreateInfo vp = {};
+  vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+  vp.viewportCount = 1;
+  vp.scissorCount = 1;
+  VkPipelineRasterizationStateCreateInfo rs = {};
+  rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+  rs.polygonMode = VK_POLYGON_MODE_FILL;
+  rs.cullMode = VK_CULL_MODE_NONE;
+  rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  rs.lineWidth = 1.0f;
+  VkPipelineMultisampleStateCreateInfo ms = {};
+  ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineDepthStencilStateCreateInfo ds = {};
+  ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+  // No blend -- the shader writes the final (copied or lifted) color.
+  VkPipelineColorBlendAttachmentState blend = {};
+  blend.blendEnable = VK_FALSE;
+  blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  VkPipelineColorBlendStateCreateInfo cb = {};
+  cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+  cb.attachmentCount = 1;
+  cb.pAttachments = &blend;
+  VkDynamicState dyn_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dyn = {};
+  dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+  dyn.dynamicStateCount = 2;
+  dyn.pDynamicStates = dyn_states;
+
+  VkPipelineRenderingCreateInfo rendering_info = {};
+  rendering_info.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+  rendering_info.colorAttachmentCount = 1;
+  rendering_info.pColorAttachmentFormats = &color_format;
+
+  VkGraphicsPipelineCreateInfo pipe_info = {};
+  pipe_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+  pipe_info.pNext = &rendering_info;
+  pipe_info.stageCount = 2;
+  pipe_info.pStages = stages;
+  pipe_info.pVertexInputState = &vtx;
+  pipe_info.pInputAssemblyState = &ia;
+  pipe_info.pViewportState = &vp;
+  pipe_info.pRasterizationState = &rs;
+  pipe_info.pMultisampleState = &ms;
+  pipe_info.pDepthStencilState = &ds;
+  pipe_info.pColorBlendState = &cb;
+  pipe_info.pDynamicState = &dyn;
+  pipe_info.layout = scene_lift_pipeline_layout_;
+  VkResult pipe_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipe_info,
+                                                       nullptr, &scene_lift_pipeline_);
+  dfn.vkDestroyShaderModule(device, vs_module, nullptr);
+  dfn.vkDestroyShaderModule(device, fs_module, nullptr);
+  if (pipe_result != VK_SUCCESS) {
+    REXGPU_ERROR("[MW2-LIFT] pipeline create failed: {}", int32_t(pipe_result));
+    scene_lift_pipeline_failed_ = true;
+    return false;
+  }
+  scene_lift_pipeline_color_format_ = color_format;
+  return true;
+}
+
+void VulkanCommandProcessor::DrawSceneShadowLift(
+    const VulkanRenderTargetCache::SceneColorLiftInputs& inputs) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  DeferredCommandBuffer& command_buffer = deferred_command_buffer_;
+
+  const float lift = float(REXCVAR_GET(scene_shadow_lift));
+  const float knee = float(REXCVAR_GET(scene_shadow_knee));
+  const float fill_r = float(REXCVAR_GET(scene_shadow_fill_r));
+  const float fill_g = float(REXCVAR_GET(scene_shadow_fill_g));
+  const float fill_b = float(REXCVAR_GET(scene_shadow_fill_b));
+
+  VkImageSubresourceRange color_range =
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
+
+  auto bind_source = [&](VkImageView src_view) -> VkDescriptorSet {
+    VkDescriptorSet set =
+        scene_lift_descriptor_sets_[scene_lift_descriptor_next_ % kSceneLiftDescriptorRing];
+    ++scene_lift_descriptor_next_;
+    VkDescriptorImageInfo img = {};
+    img.imageView = src_view;
+    img.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo samp = {};
+    samp.sampler = scene_lift_sampler_;
+    VkWriteDescriptorSet writes[2] = {};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = set;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[0].pImageInfo = &img;
+    writes[1] = writes[0];
+    writes[1].dstBinding = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    writes[1].pImageInfo = &samp;
+    dfn.vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+    return set;
+  };
+
+  auto run_pass = [&](VkImageView target_view, VkDescriptorSet set, float pass_lift) {
+    VkRenderingAttachmentInfo color_attachment = {};
+    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color_attachment.imageView = target_view;
+    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;  // fullscreen draw overwrites all
+    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rendering = {};
+    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering.renderArea.extent = inputs.extent;
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &color_attachment;
+    command_buffer.CmdVkBeginRendering(&rendering);
+    VkViewport viewport = {};
+    viewport.width = float(inputs.extent.width);
+    viewport.height = float(inputs.extent.height);
+    viewport.maxDepth = 1.0f;
+    command_buffer.CmdVkSetViewport(0, 1, &viewport);
+    VkRect2D scissor = {};
+    scissor.extent = inputs.extent;
+    command_buffer.CmdVkSetScissor(0, 1, &scissor);
+    command_buffer.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, scene_lift_pipeline_);
+    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           scene_lift_pipeline_layout_, 0, 1, &set, 0, nullptr);
+    float pc[8] = {pass_lift, knee, 0.0f, 0.0f, fill_r, fill_g, fill_b, 0.0f};
+    command_buffer.CmdVkPushConstants(scene_lift_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                      sizeof(pc), pc);
+    command_buffer.CmdVkDraw(3, 1, 0, 0);
+    command_buffer.CmdVkEndRendering();
+  };
+
+  // PASS 1: copy the scene color (already in SHADER_READ from PrepareSceneColorLift) into the
+  // scratch (transition scratch UNDEFINED -> COLOR_ATTACHMENT; we discard + overwrite every pixel).
+  PushImageMemoryBarrier(scene_lift_scratch_image_, color_range, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  SubmitBarriers(true);
+  VkDescriptorSet copy_set = bind_source(inputs.scene_color_view);
+  run_pass(scene_lift_scratch_view_, copy_set, 0.0f);
+
+  // Transition scratch -> shader-read for pass 2, and the scene color back to a color attachment.
+  PushImageMemoryBarrier(
+      scene_lift_scratch_image_, color_range, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  if (render_target_cache_) {
+    render_target_cache_->FinishSceneColorLift();  // scene color SHADER_READ -> COLOR_ATTACHMENT
+  }
+  SubmitBarriers(true);
+
+  // PASS 2: sample the scratch, apply the real lift, write the scene color.
+  VkDescriptorSet lift_set = bind_source(scene_lift_scratch_view_);
+  run_pass(inputs.scene_color_view, lift_set, lift);
+}
+
+void VulkanCommandProcessor::MaybeApplySceneShadowLift() {
+  // PARKED (dark-scene §11/§12): the scene-buffer lift writes the recorded scene-color host RT, but
+  // in the Pit the displayed frame is re-resolved from guest RAM off a DIFFERENT EDRAM base, so the
+  // write never reaches the screen (proven live: a red-fill lift left the frame unchanged; the
+  // recorded RT is also null by Resolve() time). This is the same RT-targeting wall that left the
+  // sun-shadow reproject parked. The lift now lives in the display-grade ramp (GradeChannel /
+  // scene_shadow_lift), which provably reaches the swapchain. Kept here, gated off, for a future
+  // attempt at the true pre-resolve / pre-auto-exposure lift. See lighting-hdr-scale-re-campaign
+  // §12.
+  if (!REXCVAR_GET(scene_shadow_lift_scenebuf)) {
+    return;
+  }
+  if (std::fabs(float(REXCVAR_GET(scene_shadow_lift))) < 1e-6f || !render_target_cache_) {
+    return;
+  }
+  if (scene_lift_frame_ == frame_current_) {
+    return;  // once per frame
+  }
+  VulkanRenderTargetCache::SceneColorLiftInputs inputs;
+  if (!render_target_cache_->PrepareSceneColorLift(inputs)) {
+    return;  // scene color not recorded / MSAA — leaves layout untouched
+  }
+  scene_lift_frame_ = frame_current_;  // mark attempted (avoid retry storm within the frame)
+  if (!EnsureSceneLiftScratch(inputs.scene_color_format, inputs.extent) ||
+      !EnsureSceneLiftPipeline(inputs.scene_color_format)) {
+    render_target_cache_->FinishSceneColorLift();  // restore the scene color attachment layout
+    return;
+  }
+  DrawSceneShadowLift(inputs);
 }
 
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,

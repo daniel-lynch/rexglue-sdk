@@ -160,6 +160,23 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // RTs to shader-read, fills `out`, and returns true. The command processor then runs the pass.
   bool PrepareSunShadowReproject(SunShadowReprojectInputs& out);
 
+  // IW4 scene shadow lift (dark-scene §11). The lift bounces the scene color through a scratch
+  // image (two fullscreen draws): pass 1 samples the scene color (shader-read), pass 2 writes it
+  // back (color attachment). The command processor owns the scratch + pipelines; the rt cache owns
+  // the scene-color RT layout. So PrepareSceneColorLift transitions the scene color to shader-read
+  // and returns its image/view/extent/format/msaa for pass 1, and FinishSceneColorLift transitions
+  // it back to a color attachment for pass 2 (and leaves it there, exactly like the reproject, so
+  // the resolve's DumpRenderTargets re-transitions from current_layout()). k1X only (MSAA color
+  // read would need per-sample handling) -- returns false (no-op) otherwise.
+  struct SceneColorLiftInputs {
+    VkImage scene_color_image = VK_NULL_HANDLE;  // for layout barriers (cmd proc owns the scratch)
+    VkImageView scene_color_view = VK_NULL_HANDLE;  // sampled (pass 1) + color attachment (pass 2)
+    VkExtent2D extent = {};
+    VkFormat scene_color_format = VK_FORMAT_UNDEFINED;
+  };
+  bool PrepareSceneColorLift(SceneColorLiftInputs& out);
+  void FinishSceneColorLift();
+
   // True only when `resolve_info` is the COLOR resolve of the recorded scene-color RT (matching
   // EDRAM base). Resolve() gates MaybeReprojectSunShadow on this so the once-per-frame pass fires
   // on the scene resolve -- not an earlier depth/SSAO/downsample resolve, which would blend into a

@@ -1753,6 +1753,10 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
         if (sun_shadow_scene_color_bound_prev_ && !scene_color_bound_now) {
           // Falling edge -- world pass done, run the once-per-frame reproject now (guarded inside).
           command_processor_.MaybeReprojectSunShadow();
+          // §11 scene shadow lift: same falling-edge trigger (the resolve gate never matches the
+          // host-side-consumed scene color), after the reproject's shadow multiply, before the
+          // tonemap samples the scene color. Once-per-frame guarded inside.
+          command_processor_.MaybeApplySceneShadowLift();
         }
         sun_shadow_scene_color_bound_prev_ = scene_color_bound_now;
       }
@@ -2029,6 +2033,71 @@ bool VulkanRenderTargetCache::PrepareSunShadowReproject(SunShadowReprojectInputs
   out.msaa_samples = scene_color->key().msaa_samples;
   out.scene_color_format = GetColorVulkanFormat(scene_color->key().GetColorFormat());
   return true;
+}
+
+bool VulkanRenderTargetCache::PrepareSceneColorLift(SceneColorLiftInputs& out) {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  SunShadowFrameReset();
+  if (!sun_shadow_scene_color_rt_ || !sun_shadow_scene_extent_.width ||
+      !sun_shadow_scene_extent_.height) {
+    return false;
+  }
+  auto* scene_color = static_cast<VulkanRenderTarget*>(sun_shadow_scene_color_rt_);
+  // The lift samples the scene color (pass 1) and writes it (pass 2). Sampling an MSAA color target
+  // would need a per-sample resolve in the copy shader -- restrict to single-sample (the IW4 scene
+  // color RT is k1X in the captures); no-op + warn once otherwise.
+  if (scene_color->key().msaa_samples != xenos::MsaaSamples::k1X) {
+    static bool msaa_warned = false;
+    if (!msaa_warned) {
+      msaa_warned = true;
+      REXGPU_WARN(
+          "[MW2-LIFT] scene color is {}xMSAA; scene_shadow_lift only supports single-sample, "
+          "skipping",
+          uint32_t(1) << uint32_t(scene_color->key().msaa_samples));
+    }
+    return false;
+  }
+
+  // Transition the scene color to shader-read so pass 1 can sample it (FinishSceneColorLift puts it
+  // back to a color attachment for pass 2).
+  if (scene_color->current_layout() != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    VkImageSubresourceRange range =
+        ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
+    command_processor_.PushImageMemoryBarrier(
+        scene_color->image(), range, scene_color->current_stage_mask(),
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, scene_color->current_access_mask(),
+        VK_ACCESS_SHADER_READ_BIT, scene_color->current_layout(),
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    scene_color->SetUsage(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  }
+
+  out.scene_color_image = scene_color->image();
+  out.scene_color_view = scene_color->view_depth_color();
+  out.extent = sun_shadow_scene_extent_;
+  out.scene_color_format = GetColorVulkanFormat(scene_color->key().GetColorFormat());
+  return true;
+}
+
+void VulkanRenderTargetCache::FinishSceneColorLift() {
+  if (!sun_shadow_scene_color_rt_) {
+    return;
+  }
+  auto* scene_color = static_cast<VulkanRenderTarget*>(sun_shadow_scene_color_rt_);
+  if (scene_color->current_layout() != VulkanRenderTarget::kColorDrawLayout) {
+    VkImageSubresourceRange range =
+        ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
+    command_processor_.PushImageMemoryBarrier(
+        scene_color->image(), range, scene_color->current_stage_mask(),
+        VulkanRenderTarget::kColorDrawStageMask, scene_color->current_access_mask(),
+        VulkanRenderTarget::kColorDrawAccessMask, scene_color->current_layout(),
+        VulkanRenderTarget::kColorDrawLayout);
+    scene_color->SetUsage(VulkanRenderTarget::kColorDrawStageMask,
+                          VulkanRenderTarget::kColorDrawAccessMask,
+                          VulkanRenderTarget::kColorDrawLayout);
+  }
 }
 
 VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassKey key) {
