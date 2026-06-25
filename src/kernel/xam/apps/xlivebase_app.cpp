@@ -73,6 +73,28 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       REXKRNL_DEBUG("XLiveBaseUnk58046({:08X}, {:08X}) unimplemented", buffer_ptr, buffer_length);
       return X_E_SUCCESS;
     }
+    case 0x00050009: {
+      // [COD4MP-LIVE] CoD4 (IW3) routes its Xbox Live online-storage downloads
+      // (motd / playlist / game-settings / stats) through this message via
+      // XMsgStartIORequest (see game sub_821094B8 -> XMsgStartIORequest(app=0xFC,
+      // msg=0x00050009, overlapped, buf, 40)). The real Live backend is dead, so we
+      // report success with no payload: CompleteOverlappedImmediate() then sets the
+      // overlapped length to 0, which the game treats as an empty file and falls back
+      // to defaults. This clears the otherwise-infinite "Downloading game settings"
+      // modal and lets the Xbox Live menu (Barracks / Create-a-Class) settle.
+      REXKRNL_DEBUG("CoD4 Live storage download ({:08X}, {:08X}) -> empty success", buffer_ptr,
+                    buffer_length);
+      return X_E_SUCCESS;
+    }
+    case 0x00058035: {
+      // [COD4MP-LIVE] XStorageBuildServerPath (game sub_8210AC38 -> XMsgInProcessCall).
+      // Currently also faked game-side (writes a dummy path + returns 0); handled here
+      // too so the path is consistent if the game-side hook is ever removed. Success with
+      // the caller's output buffer left as-is (the game only needs a non-error result).
+      REXKRNL_DEBUG("CoD4 XStorageBuildServerPath ({:08X}, {:08X}) -> success", buffer_ptr,
+                    buffer_length);
+      return X_E_SUCCESS;
+    }
   }
   REXKRNL_ERROR(
       "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "

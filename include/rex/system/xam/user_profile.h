@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -218,7 +219,13 @@ class UserProfile {
 
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }
-  uint32_t signin_state() const { return 1; }
+  uint32_t signin_state() const {
+    // signin=2 (SignedInToLive) unlocks Create-a-Class/Barracks but needs the whole
+    // XStorage/Live-online stack faked (motd/playlist/settings all err 1627). Gated by env
+    // COD4_LIVE so the default build stays at 1 (usable) until the fake is complete.
+    static const int live = [] { const char* v = std::getenv("COD4_LIVE"); return v && v[0] && v[0] != '0'; }();
+    return live ? 2u : 1u;
+  }
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }

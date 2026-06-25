@@ -13,6 +13,8 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <rex/chrono/clock.h>
@@ -46,6 +48,13 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+// [COD4MP-NETLOG] Diagnose the System Link host-start "active network connection" gate.
+// SDK-side log macros don't reach the game log in release, so write to a file.
+static void netlog(const char* fn, uint32_t v) {
+  FILE* f = std::fopen("/tmp/cod4_xnet.log", "a");
+  if (f) { std::fprintf(f, "[XNET] %-26s ret=0x%X (%u)\n", fn, v, v); std::fclose(f); }
+}
 
 #if !REX_PLATFORM_WIN32
 // Map a POSIX errno to the Winsock error code the guest expects. Critically,
@@ -465,8 +474,10 @@ struct XnAddrStatus {
 };
 
 u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
-  // Just return a loopback address atm.
-  addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
+  // Return a real LAN address (not loopback) so System Link host-start passes the title's
+  // "is this a LAN address / active network connection" check. 192.168.1.117 = 0xC0A80175.
+  // TODO: derive dynamically via getifaddrs (primary non-loopback IPv4) instead of hardcoding.
+  addr_ptr->ina.s_addr = htonl(0xC0A80175u);
   addr_ptr->inaOnline.s_addr = 0;
   addr_ptr->wPortOnline = 0;
 
@@ -485,7 +496,26 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
 
   std::memset(addr_ptr->abOnline, 0, 20);
 
-  return XnAddrStatus::XNET_GET_XNADDR_STATIC;
+  // Report a fully-configured wired LAN (ethernet present, has IP, gateway, DNS) — what a real
+  // console on a LAN (no Live) returns. STATIC alone reads as "not properly connected" to the
+  // System Link host check. NOT ONLINE (0x80) — that implies Xbox Live, which we don't have.
+  uint32_t st = XnAddrStatus::XNET_GET_XNADDR_ETHERNET | XnAddrStatus::XNET_GET_XNADDR_STATIC |
+                XnAddrStatus::XNET_GET_XNADDR_GATEWAY | XnAddrStatus::XNET_GET_XNADDR_DNS;
+  // [COD4MP-LIVE] When faking the dead Xbox Live backend (env COD4_LIVE / signin=2), the game's
+  // Live init polls this and requires XNET_GET_XNADDR_ONLINE (0x80); without it the Xbox Live menu
+  // aborts with "Unable to get our Xbox Live address information" (game sub_821A8160). Advertise an
+  // online-capable address: set the ONLINE bit and a non-zero online IP (reuse the LAN IP). Gated so
+  // the default System Link build (which must NOT look online) is unaffected.
+  static const bool live = [] {
+    const char* v = std::getenv("COD4_LIVE");
+    return v && v[0] && v[0] != '0';
+  }();
+  if (live) {
+    addr_ptr->inaOnline.s_addr = htonl(0xC0A80175u);
+    st |= XnAddrStatus::XNET_GET_XNADDR_ONLINE;
+  }
+  netlog("XNetGetTitleXnAddr", st);
+  return st;
 }
 
 u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -496,6 +526,7 @@ u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
 }
 
 u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, mapped_u32 id_ptr) {
+  netlog("XNetXnAddrToMachineId", 1);
   // Tell the caller we're not signed in to live (non-zero ret)
   return 1;
 }
@@ -509,6 +540,7 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
 // subsequent socket calls (like a handle to a XNet address)
 u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
                                     mapped_void in_addr) {
+  netlog("XNetXnAddrToInAddr", 1);
   return 1;
 }
 
@@ -535,7 +567,13 @@ struct XEthernetStatus {
 };
 
 u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
-  return 0;
+  // Report an active wired link so the title's "active network connection" gate
+  // (the System Link / online Notice) passes. Active + 100Mbps + full duplex.
+  uint32_t st = XEthernetStatus::XNET_ETHERNET_LINK_ACTIVE |
+                XEthernetStatus::XNET_ETHERNET_LINK_100MBPS |
+                XEthernetStatus::XNET_ETHERNET_LINK_FULL_DUPLEX;
+  netlog("XNetGetEthernetLinkStatus", st);
+  return st;
 }
 
 u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {

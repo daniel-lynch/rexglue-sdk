@@ -77,6 +77,12 @@ u32 XamContentGetDeviceName_entry(u32 device_id, mapped_wstring name_buffer, u32
 }
 
 u32 XamContentGetDeviceState_entry(u32 device_id, mapped_void overlapped_ptr) {
+  // device_id=0 ("no device selected yet") -> default to HDD, same as XamContentGetDeviceData.
+  // Without this, the title sees DEVICE_NOT_CONNECTED and fails to build storage paths (e.g. the
+  // Xbox-LIVE MOTD -> err 1627 crash, and the cached game-settings download hangs).
+  if (device_id == 0) {
+    device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
+  }
   auto device_info = GetDummyDeviceInfo(device_id);
   if (device_info == nullptr) {
     if (overlapped_ptr) {

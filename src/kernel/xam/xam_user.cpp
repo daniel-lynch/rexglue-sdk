@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cstdio>
 #include <cstring>
 
 #include <rex/cvar.h>
@@ -382,8 +383,12 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  // GRANT privileges (was hard-denied) so System Link / multiplayer host can start — the host
+  // path checks XPRIVILEGE_MULTIPLAYER_SESSIONS and a denial shows the "active network
+  // connection" Notice at Start. Log the mask to confirm what's checked.
+  *out_value = 1;
+  { FILE* f = std::fopen("/tmp/cod4_xnet.log", "a");
+    if (f) { std::fprintf(f, "[PRIV] XamUserCheckPrivilege mask=0x%X -> GRANTED\n", mask); std::fclose(f); } }
   return X_ERROR_SUCCESS;
 }
 
