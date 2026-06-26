@@ -13,6 +13,8 @@
 #include <rex/logging.h>
 #include <rex/thread.h>
 
+#include <cstring>
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -22,6 +24,26 @@ namespace apps {
 using namespace rex::system;
 
 XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
+
+namespace {
+// XSESSION_SEARCHRESULT_HEADER (8 bytes): { uint32 dwSearchResults; uint32 pResults; }.
+// The XSession*Search* messages take a caller-allocated results buffer (size in
+// results_buffer_size, address in search_results_ptr) and the kernel writes this header at its
+// start. Stubbing the search to SUCCESS without writing the header leaves the count undefined, so
+// the title never concludes "0 games found" and never falls through to hosting. Writing a
+// well-formed EMPTY result set (count = 0, pointer = 0) lets the matchmaking flow proceed to the
+// host-fallback path. For a single box + bots, hosting is exactly what we want.
+void WriteEmptySearchResults(memory::Memory* mem, uint32_t search_results_ptr,
+                             uint32_t results_buffer_size) {
+  if (!search_results_ptr || results_buffer_size < 8) {
+    // No output buffer yet (e.g. the title's size-probe pass) — nothing to write.
+    return;
+  }
+  uint8_t* results = mem->TranslateVirtual(search_results_ptr);
+  memory::store_and_swap<uint32_t>(results + 0, 0);  // dwSearchResults = 0
+  memory::store_and_swap<uint32_t>(results + 4, 0);  // pResults = nullptr
+}
+}  // namespace
 
 // http://mb.mirage.org/bugzilla/xliveless/main.c
 
@@ -81,6 +103,31 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           "{:08X})",
           session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
           nonce_ptr);
+
+      // [COD4MP-LIVE] Fill a deterministic, self-consistent XSESSION_INFO + nonce so the host
+      // session the title creates (e.g. CoD4's Find-Match host-fallback, also Private Match) is
+      // usable. Stubbing this to SUCCESS without writing the output left sessionID/nonce zeroed, so
+      // the title treated the session as invalid and immediately XSessionDelete'd it, dropping back
+      // to "Searching". For a single box + System-Link bots the host XNADDR only needs to be
+      // self-consistent (no real online routing). XSESSION_INFO (60B): XNKID sessionID @+0 (8),
+      // XNADDR hostAddress @+8 (36: ina@+8, inaOnline@+12, wPortOnline@+16, abEnet@+18, abOnline@+24),
+      // XNKEY keyExchangeKey @+44 (16).
+      if (session_info_ptr) {
+        uint8_t* si = memory_->TranslateVirtual(session_info_ptr);
+        std::memset(si, 0, 60);
+        static const uint8_t kSessionId[8] = {0x09, 0x04, 0x15, 0x60, 0x7E, 0x00, 0x00, 0x01};
+        std::memcpy(si + 0, kSessionId, 8);                 // XNKID (nonzero)
+        si[8] = 127; si[9] = 0; si[10] = 0; si[11] = 1;     // ina = 127.0.0.1
+        si[12] = 127; si[13] = 0; si[14] = 0; si[15] = 1;   // inaOnline = 127.0.0.1
+        static const uint8_t kMac[6] = {0x00, 0x15, 0x5D, 0x00, 0x00, 0x01};
+        std::memcpy(si + 18, kMac, 6);                      // abEnet (nonzero MAC)
+        si[24] = 0x01;                                      // abOnline (nonzero)
+        for (int i = 0; i < 16; i++) si[44 + i] = static_cast<uint8_t>(0xA0 + i);  // XNKEY (nonzero)
+      }
+      if (nonce_ptr) {
+        static const uint8_t kNonce[8] = {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0};
+        std::memcpy(memory_->TranslateVirtual(nonce_ptr), kNonce, 8);
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0011: {
@@ -105,6 +152,20 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       assert_zero(unk_0);
       REXKRNL_DEBUG("XGISessionJoinLocal({:08X}, {}, {}, {:08X}, {:08X})", session_ptr, user_count,
                     unk_0, user_index_array, private_slots_array);
+      return X_E_SUCCESS;
+    }
+    case 0x000B0013: {
+      // [COD4MP-LIVE] XGISessionJoinRemote — registers remote (xuid) players into the session. The
+      // title calls this right after XSessionCreate on the host path; left unimplemented it fell
+      // through to the generic FAIL (0x80004005), so the host aborted and XSessionDelete'd the brand
+      // new session, dropping back to "Searching". Report success (no real remote peers on a single
+      // box + System-Link bots).
+      uint32_t session_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
+      uint32_t user_count = memory::load_and_swap<uint32_t>(buffer + 4);
+      uint32_t xuid_array = memory::load_and_swap<uint32_t>(buffer + 8);
+      uint32_t private_slots_array = memory::load_and_swap<uint32_t>(buffer + 12);
+      REXKRNL_DEBUG("XGISessionJoinRemote({:08X}, {}, {:08X}, {:08X})", session_ptr, user_count,
+                    xuid_array, private_slots_array);
       return X_E_SUCCESS;
     }
     case 0x000B0014: {
@@ -146,6 +207,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("XSessionSearch({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X})", proc_index,
                     user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                     results_buffer_size, search_results_ptr);
+      WriteEmptySearchResults(memory_, search_results_ptr, results_buffer_size);
       return X_E_SUCCESS;
     }
     case 0x000B0018: {
@@ -181,6 +243,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                     proc_index, user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                     results_buffer_size, search_results_ptr, num_users);
 
+      WriteEmptySearchResults(memory_, search_results_ptr, results_buffer_size);
       return X_E_SUCCESS;
     }
     case 0x000B001D: {
@@ -406,6 +469,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           non_weighted_search_properties_ptr, non_weighted_search_contexts_ptr, results_buffer_size,
           search_results_ptr, num_users, weighted_search);
 
+      WriteEmptySearchResults(memory_, search_results_ptr, results_buffer_size);
       return X_E_SUCCESS;
     }
     case 0x000B0071: {

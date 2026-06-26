@@ -73,6 +73,18 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       REXKRNL_DEBUG("XLiveBaseUnk58046({:08X}, {:08X}) unimplemented", buffer_ptr, buffer_length);
       return X_E_SUCCESS;
     }
+    case 0x0005800E: {
+      // [COD4MP-LIVE] Polled in a tight loop by the Find-Match / party matchmaking pump (≈3400×
+      // during a single lobby search). Undocumented here; left unimplemented it fell through to the
+      // generic FAIL (X_E_FAIL / 0x80004005), which appears to keep the search loop from concluding
+      // "0 games found -> host". Treat it as a connection/notify status poll and report
+      // success/idle so the matchmaking state machine can advance to the host-fallback path. No
+      // known output payload — return success without writing the caller's buffers (mirrors
+      // 0x00058046). Gated behind the COD4_LIVE fake overall.
+      REXKRNL_DEBUG("XLiveBase 0x0005800E status poll ({:08X}, {:08X}) -> success", buffer_ptr,
+                    buffer_length);
+      return X_E_SUCCESS;
+    }
     case 0x00050009: {
       // [COD4MP-LIVE] CoD4 (IW3) routes its Xbox Live online-storage downloads
       // (motd / playlist / game-settings / stats) through this message via

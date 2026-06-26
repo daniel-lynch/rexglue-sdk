@@ -229,6 +229,19 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
 
   // TODO(gibbed): setting validity checking without needing a user profile
   // object.
+  // [COD4MP-PROFILE] Trace which profile settings the title requests (gated COD4_PROFILE_TRACE).
+  // CoD4 reads its rank/XP/prestige/unlocks/custom-classes from the title-specific binary blobs
+  // 0x63E83FFF (TITLE_SPECIFIC1) / 0x63E83FFD (TITLE_SPECIFIC3); empty default -> rank 1, classes locked.
+  if (const char* t = std::getenv("COD4_PROFILE_TRACE"); t && t[0] && t[0] != '0') {
+    for (uint32_t i = 0; i < setting_count; ++i) {
+      auto setting = user_profile->GetSetting(static_cast<uint32_t>(setting_ids[i]));
+      std::fprintf(stderr, "[COD4MP-PROFILE] ReadProfileSettings req id=%08X (title=%08X user=%u) -> %s%s\n",
+                   (unsigned)(uint32_t)setting_ids[i], (unsigned)title_id, (unsigned)user_index,
+                   setting ? "present" : "MISSING",
+                   (setting && setting->is_set) ? "+set" : "+empty");
+    }
+    std::fflush(stderr);
+  }
   bool any_missing = false;
   for (uint32_t i = 0; i < setting_count; ++i) {
     auto setting_id = static_cast<uint32_t>(setting_ids[i]);

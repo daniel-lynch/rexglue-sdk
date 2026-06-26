@@ -9,10 +9,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <charconv>
 #include <sstream>
+#include <string_view>
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
@@ -21,12 +24,52 @@ namespace rex {
 namespace system {
 namespace xam {
 
+// Local-profile selection cvars (set from the host-side profile store before kernel init; see
+// the game app's OnFinalizePaths). name_/xuid_ drive the per-profile content dir
+// (<user_data_root>/<title>/profile/<name>/...), so each profile keeps its own title-specific
+// save blobs (rank/XP/unlocks/custom classes). Mirrors the skate3 recomp profile system.
+REXCVAR_DEFINE_BOOL(user_profile_signed_in, true, "Kernel",
+                    "Whether user slot 0 starts with a local profile");
+REXCVAR_DEFINE_BOOL(user_live_signed_in, false, "Kernel",
+                    "Whether user slot 0 starts signed in to Xbox Live");
+REXCVAR_DEFINE_STRING(selected_user_profile, "player", "Kernel/Profile",
+                      "Selected local Xbox profile id");
+REXCVAR_DEFINE_STRING(user_profile_name, "Player", "Kernel/Profile",
+                      "Selected local Xbox profile gamertag");
+REXCVAR_DEFINE_STRING(user_profile_xuid, "B13E07DFF9AB6772", "Kernel/Profile",
+                      "Selected local Xbox profile XUID");
+
+namespace {
+
+uint64_t ParseXuid(std::string_view value) {
+  std::string text(value);
+  if (text.starts_with("0x") || text.starts_with("0X")) {
+    text.erase(0, 2);
+  }
+  uint64_t parsed = 0;
+  auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), parsed, 16);
+  if (ec == std::errc() && ptr == text.data() + text.size()) {
+    return parsed;
+  }
+  parsed = 0;
+  std::from_chars(value.data(), value.data() + value.size(), parsed, 10);
+  return parsed;
+}
+
+}  // namespace
+
 UserProfile::UserProfile() {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
-  xuid_ = 0xB13EBABEBABEBABE;
-  name_ = "User";
+  xuid_ = ParseXuid(REXCVAR_GET(user_profile_xuid));
+  if (xuid_ == 0) {
+    xuid_ = 0xB13EBABEBABEBABE;
+  }
+  name_ = REXCVAR_GET(user_profile_name);
+  if (name_.empty()) {
+    name_ = "User";
+  }
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py

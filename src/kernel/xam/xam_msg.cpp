@@ -23,11 +23,34 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+
 namespace rex {
 namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+namespace {
+// [COD4MP-LIVE] Experiment: hold the Find-Match session search (XGI app 0xFB, msg 0x000B001C)
+// IO_PENDING for a configurable delay before completing it empty, instead of completing instantly.
+// Hypothesis: IW3's matchmaking loop re-fires the search every frame and only hosts after it has
+// "searched" for some wall-clock time with 0 results; instant completion keeps resetting that and
+// it never falls through to XSessionCreate. COD4_MM_SEARCH_DELAY_MS=0 (default) = original instant
+// behavior (no thread, default build unchanged). A single in-flight guard keeps at most one delayed
+// completion outstanding (the title waits per-frame, so it never stacks in practice).
+uint32_t mm_search_delay_ms() {
+  static const uint32_t ms = [] {
+    const char* v = std::getenv("COD4_MM_SEARCH_DELAY_MS");
+    return (v && v[0]) ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
+  }();
+  return ms;
+}
+std::atomic<bool> g_mm_search_in_flight{false};
+}  // namespace
 
 u32 XMsgInProcessCall_entry(u32 app, u32 message, u32 arg1, u32 arg2) {
   auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageSync(app, message, arg1, arg2);
@@ -62,8 +85,30 @@ X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overla
     XThread::SetLastError(X_ERROR_NOT_FOUND);
   }
   if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, result);
-    result = X_ERROR_IO_PENDING;
+    const bool delay_search = app == 0xFB && message == 0x000B001C && mm_search_delay_ms() != 0;
+    if (delay_search && !g_mm_search_in_flight.exchange(true)) {
+      // Defer the empty completion ~N ms on a detached thread so the title's search-duration timer
+      // can elapse -> host fallback. The async DispatchMessageAsync above already wrote the empty
+      // result header; here we only stall the overlapped completion. Event-based
+      // XamGetOverlappedResult observes IO_PENDING until the event is set (the title polls the
+      // event, not a completion APC), so completing from a host thread is safe.
+      auto* ks = REX_KERNEL_STATE();
+      auto* ov = ks->memory()->TranslateVirtual(overlapped_ptr);
+      XOverlappedSetResult(ov, X_ERROR_IO_PENDING);
+      XOverlappedSetContext(ov, XThread::GetCurrentThreadHandle());
+      const uint32_t ovp = overlapped_ptr;
+      const X_HRESULT r = result;
+      const uint32_t delay_ms = mm_search_delay_ms();
+      std::thread([ks, ovp, r, delay_ms]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        ks->CompleteOverlappedEx(ovp, r, r, r ? 0xFFFFFFFFu : 0u);
+        g_mm_search_in_flight.store(false);
+      }).detach();
+      result = X_ERROR_IO_PENDING;
+    } else {
+      REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, result);
+      result = X_ERROR_IO_PENDING;
+    }
   }
   if (result == X_ERROR_SUCCESS || result == X_ERROR_IO_PENDING) {
     XThread::SetLastError(0);

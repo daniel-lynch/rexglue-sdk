@@ -626,7 +626,12 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
 
 u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
                                u32 flags) {
-  return X_ERROR_FUNCTION_FAILED;
+  // [COD4MP-LIVE] A host registers a QoS responder so peers can probe its session. Returning a
+  // failure here made CoD4's Find-Match / Private-Match host path abort with "Microsoft error N when
+  // trying to listen for QoS queries for gameSession" and immediately XSessionDelete the new host
+  // session. On a single box (+ System-Link bots) there is no real QoS traffic to service, so report
+  // the listener as successfully established and let hosting proceed.
+  return X_ERROR_SUCCESS;
 }
 
 u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
