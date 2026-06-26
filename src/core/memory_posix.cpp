@@ -134,23 +134,71 @@ static bool ParseProcMapsLine(const std::string& line, LinuxMapEntry& out) {
   return out.start < out.end;
 }
 
-// Find the mapping entry in /proc/self/maps that contains the given address
+// Parse the start-end-perms prefix of a /proc/self/maps line from a raw char span (no std::string /
+// sscanf / locale). The fields we need are at the very start of the line: "<hexstart>-<hexend> <perms> ...".
+static inline bool HexDigit(char c, int& v) {
+  if (c >= '0' && c <= '9') { v = c - '0'; return true; }
+  if (c >= 'a' && c <= 'f') { v = c - 'a' + 10; return true; }
+  if (c >= 'A' && c <= 'F') { v = c - 'A' + 10; return true; }
+  return false;
+}
+static bool ParseProcMapsSpan(const char* s, size_t len, LinuxMapEntry& out) {
+  out = LinuxMapEntry{};
+  size_t i = 0;
+  int d;
+  uintptr_t start = 0, end = 0;
+  if (i >= len || !HexDigit(s[i], d)) return false;
+  for (; i < len && HexDigit(s[i], d); ++i) start = (start << 4) | (uintptr_t)d;
+  if (i >= len || s[i] != '-') return false;
+  ++i;
+  if (i >= len || !HexDigit(s[i], d)) return false;
+  for (; i < len && HexDigit(s[i], d); ++i) end = (end << 4) | (uintptr_t)d;
+  if (i >= len || s[i] != ' ') return false;
+  ++i;
+  if (i + 4 > len) return false;
+  out.start = start;
+  out.end = end;
+  out.perms[0] = s[i]; out.perms[1] = s[i + 1]; out.perms[2] = s[i + 2]; out.perms[3] = s[i + 3];
+  out.perms[4] = '\0';
+  return out.start < out.end;
+}
+
+// Find the mapping entry in /proc/self/maps that contains the given address.
+// Hot path: this runs inside the SIGSEGV handler (MMIOHandler::ExceptionCallback -> QueryProtect) on EVERY
+// guest memory fault. The old std::ifstream + std::getline version allocated a std::string per line, used
+// the locale, and did many tiny reads — turning a guest fault-storm (e.g. CoD4 multi-bot spawn corrupting
+// the GSC VM, mw-recomp-mp) into a multi-second 100%-CPU freeze. This raw read()/manual-parse version keeps
+// the data always-fresh (correct for the write-watch-cleared-by-another-thread recheck) while being far
+// faster and async-signal-safe (only open/read/close syscalls + stack buffers, no malloc). Early-exits on
+// the first containing mapping.
 static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
   const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
-  std::ifstream maps("/proc/self/maps");
-  if (!maps.is_open())
+  const int fd = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
     return false;
-  std::string line;
-  while (std::getline(maps, line)) {
-    LinuxMapEntry e;
-    if (!ParseProcMapsLine(line, e))
-      continue;
-    if (addr >= e.start && addr < e.end) {
-      out_entry = e;
-      return true;
+  char buf[8192];
+  char line[160];       // start-end-perms prefix is < 50 chars; extra of a long line is harmlessly dropped
+  size_t line_len = 0;
+  bool found = false;
+  ssize_t n;
+  while (!found && (n = ::read(fd, buf, sizeof(buf))) > 0) {
+    for (ssize_t i = 0; i < n; ++i) {
+      const char c = buf[i];
+      if (c == '\n') {
+        LinuxMapEntry e;
+        if (ParseProcMapsSpan(line, line_len, e) && addr >= e.start && addr < e.end) {
+          out_entry = e;
+          found = true;
+          break;
+        }
+        line_len = 0;
+      } else if (line_len < sizeof(line)) {
+        line[line_len++] = c;   // once full we stop appending; the needed prefix is already captured
+      }
     }
   }
-  return false;
+  ::close(fd);
+  return found;
 }
 
 // Check if [base, base+length) is fully covered by existing mappings (no gaps)
