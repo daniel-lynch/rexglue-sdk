@@ -13,7 +13,26 @@
 #include <rex/logging.h>
 #include <rex/thread.h>
 
+#include <array>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <string>
+#include <vector>
+
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+// [COD4MP-MMBROKER] this process's game-socket real OS ports (defined in src/system/xsocket.cpp), so
+// XSessionCreate can advertise the host's actual loopback port to a joining peer.
+namespace rex { namespace system {
+extern uint16_t g_host_real_ports[8];
+extern int g_host_real_port_count;
+}}  // namespace rex::system
 
 namespace rex {
 namespace kernel {
@@ -42,6 +61,183 @@ void WriteEmptySearchResults(memory::Memory* mem, uint32_t search_results_ptr,
   uint8_t* results = mem->TranslateVirtual(search_results_ptr);
   memory::store_and_swap<uint32_t>(results + 0, 0);  // dwSearchResults = 0
   memory::store_and_swap<uint32_t>(results + 4, 0);  // pResults = nullptr
+}
+
+// ===========================================================================
+// [COD4MP-MMBROKER] Cross-instance session registry (matchmaking broker).
+//
+// The host-fallback path makes every instance host its own empty Live session, so two clients never
+// meet: XSessionSearch always returns 0 results. The broker fixes that by having the HOST publish its
+// XSESSION_INFO to a shared on-disk registry, and the searching CLIENT read that registry and return
+// the host as a real search result — so Find-Match on B discovers A's session and joins it through the
+// title's normal Live-join path (XNet secure addressing negotiated by the join, no raw direct connect).
+//
+// Transport is a directory of one-file-per-host blobs (works for two local instances now; a UDP/LSP
+// announce backend for cross-machine VPN is the planned follow-up — same publish/read interface).
+// Gated by env COD4_MM_BROKER (off => original WriteEmptySearchResults host-fallback behaviour).
+//
+// XSESSION_SEARCHRESULT (0x5C): XSESSION_INFO info @0x00 (60), dwOpenPublicSlots @0x3C,
+// dwOpenPrivateSlots @0x40, dwFilledPublicSlots @0x44, dwFilledPrivateSlots @0x48, cProperties @0x4C,
+// cContexts @0x50, pProperties @0x54, pContexts @0x58.
+constexpr uint32_t kSearchResultSize = 0x5C;
+constexpr uint32_t kSessionInfoSize = 60;
+constexpr uint32_t kBrokerMagic = 0x4D4D4252;  // "MMBR"
+constexpr int64_t kBrokerTtlSec = 900;         // entries older than this are ignored / reaped
+                                               // (generous: covers the 2nd client's boot gap; only
+                                               // guards against a crashed host leaving a stale file)
+
+struct BrokerEntry {
+  uint32_t magic;
+  uint32_t version;
+  int32_t pid;
+  int64_t ts;                         // last-published unix time (liveness)
+  uint8_t info[kSessionInfoSize];     // XSESSION_INFO exactly as it sits in guest memory (big-endian)
+  uint32_t open_public, open_private;
+  uint32_t filled_public, filled_private;
+};
+
+bool broker_on() {
+  const char* v = std::getenv("COD4_MM_BROKER");
+  return v && v[0] && v[0] != '0';
+}
+
+std::string broker_dir() {
+  if (const char* d = std::getenv("COD4_MM_REGISTRY"); d && d[0]) return d;
+  return "/tmp/cod4_mp_sessions";
+}
+
+std::string broker_own_path() {
+  return broker_dir() + "/" + std::to_string((int)getpid()) + ".session";
+}
+
+void BrokerTrace(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+
+void BrokerPublishHost(const uint8_t* guest_session_info, uint32_t open_public,
+                       uint32_t open_private, uint32_t filled_public, uint32_t filled_private) {
+  std::string dir = broker_dir();
+  ::mkdir(dir.c_str(), 0777);
+  BrokerEntry e{};
+  e.magic = kBrokerMagic;
+  e.version = 1;
+  e.pid = (int)getpid();
+  e.ts = (int64_t)::time(nullptr);
+  std::memcpy(e.info, guest_session_info, kSessionInfoSize);
+  e.open_public = open_public;
+  e.open_private = open_private;
+  e.filled_public = filled_public;
+  e.filled_private = filled_private;
+  std::string path = broker_own_path();
+  std::string tmp = path + ".tmp";
+  if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+    std::fwrite(&e, sizeof e, 1, f);
+    std::fclose(f);
+    std::rename(tmp.c_str(), path.c_str());  // atomic swap so a reader never sees a half file
+  }
+  REXKRNL_DEBUG("[MMBROKER] published host session pid={} open_pub={}", e.pid, open_public);
+  BrokerTrace("PUBLISH: open_pub=%u open_priv=%u", open_public, open_private);
+}
+
+// NOTE: a single instance creates MULTIPLE sessions over a Find-Match flow (a transient search session
+// AND the real host session). Since the registry file is keyed by PID, removing it on ANY XSessionDelete
+// wiped the host advertisement when the title tore down its search session right after starting to host
+// (observed: host reaches the lobby with open_pub=17, then its file vanishes -> a joiner finds nothing).
+// So we DON'T delete on XSessionDelete; the TTL reaps a genuinely-gone host. The latest PUBLISH (the host
+// session) is what stays advertised.
+void BrokerRemoveHost() { BrokerTrace("REMOVE (no-op; TTL-reaped): %s", broker_own_path().c_str()); }
+
+// Direct file trace (bypasses REXKRNL_DEBUG log-level gating) so the cross-instance flow is observable
+// during bring-up. Appends to <registry>/trace.log. Always on when the broker is on; cheap.
+void BrokerTrace(const char* fmt, ...) {
+  std::string path = broker_dir() + "/trace.log";
+  FILE* f = std::fopen(path.c_str(), "a");
+  if (!f) return;
+  std::fprintf(f, "[pid %d t %ld] ", (int)getpid(), (long)::time(nullptr));
+  va_list ap;
+  va_start(ap, fmt);
+  std::vfprintf(f, fmt, ap);
+  va_end(ap);
+  std::fputc('\n', f);
+  std::fclose(f);
+}
+
+// Collect live host sessions published by OTHER instances (skip our own pid + stale entries).
+std::vector<BrokerEntry> BrokerReadHosts() {
+  std::vector<BrokerEntry> out;
+  std::string dir = broker_dir();
+  DIR* d = ::opendir(dir.c_str());
+  if (!d) return out;
+  int32_t self = (int)getpid();
+  int64_t now = (int64_t)::time(nullptr);
+  while (dirent* de = ::readdir(d)) {
+    const char* nm = de->d_name;
+    size_t L = std::strlen(nm);
+    if (L < 9 || std::strcmp(nm + L - 8, ".session") != 0) continue;
+    std::string path = dir + "/" + nm;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) continue;
+    BrokerEntry e{};
+    size_t got = std::fread(&e, 1, sizeof e, f);
+    std::fclose(f);
+    if (got != sizeof e || e.magic != kBrokerMagic) continue;
+    if (e.pid == self) continue;                       // never return our own session
+    if (now - e.ts > kBrokerTtlSec) {                  // stale (host gone) — reap and skip
+      std::remove(path.c_str());
+      continue;
+    }
+    out.push_back(e);
+  }
+  ::closedir(d);
+  return out;
+}
+
+// Write the discovered hosts into the title's results buffer as XSESSION_SEARCHRESULTs. Returns true
+// if it wrote a (possibly zero-count) well-formed result set; false if there is nothing to advertise
+// (caller then falls back to WriteEmptySearchResults / host-fallback).
+bool BrokerWriteSearchResults(memory::Memory* mem, uint32_t search_results_ptr,
+                              uint32_t results_buffer_size, uint32_t max_results) {
+  if (!broker_on()) return false;
+  std::vector<BrokerEntry> hosts = BrokerReadHosts();
+  BrokerTrace("SEARCH: peer_hosts=%zu results_ptr=%08X buf_size=%u max_results=%u", hosts.size(),
+              search_results_ptr, results_buffer_size, max_results);
+  if (hosts.empty()) return false;                     // no peer hosting -> let host-fallback run
+  if (!search_results_ptr || results_buffer_size < 8) {
+    BrokerTrace("SEARCH: deferring (size-probe: ptr=%08X size=%u)", search_results_ptr,
+                results_buffer_size);
+    return false;                                      // size-probe pass: defer
+  }
+
+  uint32_t fit = (results_buffer_size - 8) / kSearchResultSize;
+  uint32_t count = (uint32_t)hosts.size();
+  if (max_results && count > max_results) count = max_results;
+  if (count > fit) count = fit;
+
+  uint8_t* base = mem->TranslateVirtual(search_results_ptr);
+  uint32_t array_va = search_results_ptr + 8;          // results array right after the 8-byte header
+  memory::store_and_swap<uint32_t>(base + 0, count);   // dwSearchResults
+  memory::store_and_swap<uint32_t>(base + 4, count ? array_va : 0);  // pResults
+
+  for (uint32_t i = 0; i < count; i++) {
+    uint8_t* r = base + 8 + i * kSearchResultSize;
+    std::memcpy(r + 0x00, hosts[i].info, kSessionInfoSize);  // XSESSION_INFO (already big-endian)
+    memory::store_and_swap<uint32_t>(r + 0x3C, hosts[i].open_public);
+    memory::store_and_swap<uint32_t>(r + 0x40, hosts[i].open_private);
+    memory::store_and_swap<uint32_t>(r + 0x44, hosts[i].filled_public);
+    memory::store_and_swap<uint32_t>(r + 0x48, hosts[i].filled_private);
+    memory::store_and_swap<uint32_t>(r + 0x4C, 0);     // cProperties
+    memory::store_and_swap<uint32_t>(r + 0x50, 0);     // cContexts
+    memory::store_and_swap<uint32_t>(r + 0x54, 0);     // pProperties
+    memory::store_and_swap<uint32_t>(r + 0x58, 0);     // pContexts
+  }
+  REXKRNL_DEBUG("[MMBROKER] search returned {} host session(s) (fit={}, max={})", count, fit,
+                max_results);
+  for (uint32_t i = 0; i < count; i++) {
+    const uint8_t* in = hosts[i].info;
+    uint16_t port = (uint16_t)((in[16] << 8) | in[17]);  // XNADDR wPortOnline
+    BrokerTrace("SEARCH: result[%u] xnkid=%02X%02X%02X%02X%02X%02X%02X%02X port=%u", i, in[0], in[1],
+                in[2], in[3], in[4], in[5], in[6], in[7], port);
+  }
+  BrokerTrace("SEARCH: RETURNED %u host session(s) to title (fit=%u)", count, fit);
+  return true;
 }
 }  // namespace
 
@@ -115,18 +311,54 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       if (session_info_ptr) {
         uint8_t* si = memory_->TranslateVirtual(session_info_ptr);
         std::memset(si, 0, 60);
-        static const uint8_t kSessionId[8] = {0x09, 0x04, 0x15, 0x60, 0x7E, 0x00, 0x00, 0x01};
-        std::memcpy(si + 0, kSessionId, 8);                 // XNKID (nonzero)
+        // [COD4MP-MMBROKER] UNIQUE XNKID per host process. Was a shared static constant — so every
+        // instance's session had the SAME session ID, and a joining peer's matchmaking treated a
+        // discovered host's session as its OWN (never actually joining the remote host, just resolving
+        // its own address). Derive a stable-per-process id from pid+time; keep byte0=0x09 (session
+        // type bits some titles check). Computed once so this process's session id stays consistent.
+        static const std::array<uint8_t, 8> kSessionId = [] {
+          std::array<uint8_t, 8> id{};
+          uint64_t seed = (static_cast<uint64_t>(getpid()) << 32) ^ static_cast<uint64_t>(::time(nullptr));
+          id[0] = 0x09;
+          for (int i = 1; i < 8; i++) id[i] = static_cast<uint8_t>((seed >> (8 * (i - 1))) & 0xFF);
+          return id;
+        }();
+        std::memcpy(si + 0, kSessionId.data(), 8);          // XNKID (unique per host process)
         si[8] = 127; si[9] = 0; si[10] = 0; si[11] = 1;     // ina = 127.0.0.1
         si[12] = 127; si[13] = 0; si[14] = 0; si[15] = 1;   // inaOnline = 127.0.0.1
         static const uint8_t kMac[6] = {0x00, 0x15, 0x5D, 0x00, 0x00, 0x01};
         std::memcpy(si + 18, kMac, 6);                      // abEnet (nonzero MAC)
         si[24] = 0x01;                                      // abOnline (nonzero)
         for (int i = 0; i < 16; i++) si[44 + i] = static_cast<uint8_t>(0xA0 + i);  // XNKEY (nonzero)
+        // [COD4MP-MMBROKER] stamp the host's REAL game-socket OS port into wPortOnline so a joining
+        // peer reaches THIS process's actual loopback socket (the guest's Xbox port is ephemeral-
+        // remapped at bind — see xsocket.cpp). Which of the host's sockets is the match/VDP one is
+        // selectable via COD4_MM_PORT_IDX (default 0) during bring-up.
+        int pidx = 0;
+        if (const char* pi = std::getenv("COD4_MM_PORT_IDX")) pidx = std::atoi(pi);
+        if (pidx < 0 || pidx >= rex::system::g_host_real_port_count) pidx = 0;
+        uint16_t hport = rex::system::g_host_real_port_count > 0
+                             ? rex::system::g_host_real_ports[pidx]
+                             : 0;
+        si[16] = static_cast<uint8_t>((hport >> 8) & 0xFF);  // wPortOnline (big-endian)
+        si[17] = static_cast<uint8_t>(hport & 0xFF);
+        BrokerTrace(
+            "XSessionCreate: OWN xnkid=%02X%02X%02X%02X%02X%02X%02X%02X port idx=%d -> wPortOnline=%u "
+            "(of %d sockets)",
+            si[0], si[1], si[2], si[3], si[4], si[5], si[6], si[7], pidx, (unsigned)hport,
+            rex::system::g_host_real_port_count);
       }
       if (nonce_ptr) {
         static const uint8_t kNonce[8] = {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0};
         std::memcpy(memory_->TranslateVirtual(nonce_ptr), kNonce, 8);
+      }
+      // [COD4MP-MMBROKER] Publish this host session so a searching peer can discover + join it. In
+      // this title only the host-fallback path reaches XSessionCreate with a session_info to fill, so
+      // a present session_info_ptr is a safe "we are hosting" trigger (don't gate on a guessed host
+      // flag bit, which would silently publish nothing if wrong; `flags`=0x{:08X} is logged above).
+      if (broker_on() && session_info_ptr) {
+        BrokerPublishHost(memory_->TranslateVirtual(session_info_ptr), num_slots_public,
+                          num_slots_private, 0, 0);
       }
       return X_E_SUCCESS;
     }
@@ -138,6 +370,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
 
       REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
+
+      if (broker_on()) BrokerRemoveHost();  // [COD4MP-MMBROKER] stop advertising a torn-down session
 
       return X_E_SUCCESS;
     }
@@ -207,7 +441,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("XSessionSearch({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X})", proc_index,
                     user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                     results_buffer_size, search_results_ptr);
-      WriteEmptySearchResults(memory_, search_results_ptr, results_buffer_size);
+      // [COD4MP-MMBROKER] return discovered peer hosts; else fall back to empty (host-fallback).
+      if (!BrokerWriteSearchResults(memory_, search_results_ptr, results_buffer_size, num_results))
+        WriteEmptySearchResults(memory_, search_results_ptr, results_buffer_size);
       return X_E_SUCCESS;
     }
     case 0x000B0018: {
@@ -243,7 +479,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                     proc_index, user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                     results_buffer_size, search_results_ptr, num_users);
 
-      WriteEmptySearchResults(memory_, search_results_ptr, results_buffer_size);
+      // [COD4MP-MMBROKER] return discovered peer hosts; else fall back to empty (host-fallback).
+      if (!BrokerWriteSearchResults(memory_, search_results_ptr, results_buffer_size, num_results))
+        WriteEmptySearchResults(memory_, search_results_ptr, results_buffer_size);
       return X_E_SUCCESS;
     }
     case 0x000B001D: {

@@ -9,7 +9,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+
+#include <unistd.h>
 
 #include <rex/kernel/xam/module.h>
 #include <rex/platform.h>
@@ -32,6 +37,14 @@
 #endif
 
 namespace rex::system {
+
+// [COD4MP-MMBROKER] Real OS ports of this process's game sockets (getsockname after Bind), in bind
+// order. The matchmaking broker (xgi_app.cpp XSessionCreate) advertises one of these as the host's
+// session port so a joining peer can reach the host's actual loopback socket. Which index is the
+// match/VDP socket is selectable via COD4_MM_PORT_IDX during bring-up.
+uint16_t g_host_real_ports[8] = {0};
+int g_host_real_port_count = 0;
+
 
 XSocket::XSocket(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
 
@@ -162,6 +175,27 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
 
   bound_ = true;
   bound_port_ = name->sin_port;
+
+  // [COD4MP-MMBROKER] Capture the REAL OS-assigned port (getsockname) — the guest only knows the Xbox
+  // port it requested (often unbindable -> ephemeral fallback), so for cross-instance P2P we must
+  // advertise the actual port. Trace requested-vs-real so we can identify the match/VDP socket.
+  {
+    sockaddr_in sa{};
+    socklen_t sl = sizeof(sa);
+    if (getsockname(native_handle_, (sockaddr*)&sa, &sl) == 0) {
+      real_bound_port_ = ntohs(sa.sin_port);
+      if (real_bound_port_ && g_host_real_port_count < 8)
+        g_host_real_ports[g_host_real_port_count++] = real_bound_port_;
+    }
+    const char* d = std::getenv("COD4_MM_REGISTRY");
+    std::string path = std::string(d && d[0] ? d : "/tmp/cod4_mp_sessions") + "/nettrace.log";
+    if (FILE* f = std::fopen(path.c_str(), "a")) {
+      std::fprintf(f, "[pid %d] BIND fd=%d requested_xbox_port=%u -> real_os_port=%u\n",
+                   (int)getpid(), (int)native_handle_, (unsigned)ntohs(name->sin_port),
+                   (unsigned)real_bound_port_);
+      std::fclose(f);
+    }
+  }
 
   return X_STATUS_SUCCESS;
 }

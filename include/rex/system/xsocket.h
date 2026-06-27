@@ -95,6 +95,7 @@ class XSocket : public XObject {
 
   uint64_t native_handle() const { return native_handle_; }
   uint16_t bound_port() const { return bound_port_; }
+  uint16_t real_bound_port() const { return real_bound_port_; }  // [COD4MP-MMBROKER] actual OS port
 
   X_STATUS Initialize(AddressFamily af, Type type, Protocol proto);
   X_STATUS Close();
@@ -138,6 +139,7 @@ class XSocket : public XObject {
 
   bool bound_ = false;  // Explicitly bound to an IP address?
   uint16_t bound_port_ = 0;
+  uint16_t real_bound_port_ = 0;  // [COD4MP-MMBROKER] OS-assigned port (getsockname after Bind)
 
   bool broadcast_socket_ = false;
 

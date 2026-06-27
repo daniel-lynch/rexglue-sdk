@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <cerrno>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -538,10 +539,46 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
 
 // This converts a XNet address to an IN_ADDR. The IN_ADDR is used for
 // subsequent socket calls (like a handle to a XNet address)
+// [COD4MP-MMBROKER] Shared net trace (REXKRNL netlog() doesn't reach the game stdout log). Appends to
+// <COD4_MM_REGISTRY|/tmp/cod4_mp_sessions>/nettrace.log so the cross-instance connect path is visible.
+static void NetTrace(const char* fmt, ...) {
+  const char* d = std::getenv("COD4_MM_REGISTRY");
+  std::string path = std::string(d && d[0] ? d : "/tmp/cod4_mp_sessions") + "/nettrace.log";
+  FILE* f = std::fopen(path.c_str(), "a");
+  if (!f) return;
+  std::fprintf(f, "[pid %d] ", (int)getpid());
+  va_list ap;
+  va_start(ap, fmt);
+  std::vfprintf(f, fmt, ap);
+  va_end(ap);
+  std::fputc('\n', f);
+  std::fclose(f);
+}
+
 u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
                                     mapped_void in_addr) {
-  netlog("XNetXnAddrToInAddr", 1);
-  return 1;
+  // [COD4MP-MMBROKER] Resolve a peer XNADDR -> a connectable in_addr. Was `return 1` (failure) + no
+  // write, so the matchmaking JOIN couldn't form an address and the client host-fell-back. For local
+  // two-instance / loopback bring-up, hand back 127.0.0.1 and trace the peer XNADDR (ina + port) so we
+  // can see what CoD4 then connects to (tcpdump lo). NOTE: in_addr carries IP only; the port comes
+  // from elsewhere (session XNADDR wPortOnline / a fixed title port) — that's the open RE question.
+  uint32_t peer_ina = 0, peer_inaonline = 0;
+  uint16_t peer_port = 0;
+  if (xn_addr) {
+    peer_ina = xn_addr->ina.s_addr;
+    peer_inaonline = xn_addr->inaOnline.s_addr;
+    peer_port = xn_addr->wPortOnline;
+  }
+  if (in_addr) {
+    uint8_t lo[4] = {127, 0, 0, 1};
+    std::memcpy(REX_KERNEL_MEMORY()->TranslateVirtual(in_addr.guest_address()), lo, 4);
+  }
+  uint8_t xk[8] = {0};
+  if (xid) std::memcpy(xk, REX_KERNEL_MEMORY()->TranslateVirtual(xid.guest_address()), 8);
+  NetTrace("XNetXnAddrToInAddr: xnkid=%02X%02X%02X%02X%02X%02X%02X%02X ina=%08X port=%u -> 127.0.0.1",
+           xk[0], xk[1], xk[2], xk[3], xk[4], xk[5], xk[6], xk[7], rex::byte_swap(peer_ina),
+           (unsigned)peer_port);
+  return 0;
 }
 
 // Does the reverse of the above.
@@ -612,6 +649,50 @@ u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, m
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
     assert_not_null(ev);
     ev->Set(0, false);
+  }
+  return 0;
+}
+
+// [COD4MP-MMBROKER] Implemented (was a stub) so the matchmaking-broker JOIN can proceed. After the
+// searching client discovers a host via XSessionSearch (see xgi_app.cpp [COD4MP-MMBROKER]), CoD4's
+// "Getting match quality" step calls XNetQosLookup to probe each discovered host. With this a stub it
+// returned nothing, so the title hung on that screen and never joined. We report every target as
+// successfully contacted with a good RTT so the title accepts the match and continues to the join.
+//
+// XNetQosLookup(cxna, apxna[], apxnkid[], apxnkey[], cina, aina[], adwServiceId[], cProbes,
+//               dwBitsPerSec, dwFlags, hEvent, ppxnqos). With the injected `caller` as arg0, args 8+
+// (cProbes..ppxnqos) are stack-passed — the export arg-loader marshals them (r1+0x54+(arg-8)*8).
+// XNQOSINFO flags: 0x01 COMPLETE, 0x02 TARGET_CONTACTED, 0x08 DATA_RECEIVED.
+u32 NetDll_XNetQosLookup_entry(u32 caller, u32 cxna, u32 apxna, u32 apxnkid, u32 apxnkey, u32 cina,
+                               u32 aina, u32 adwServiceId, u32 cProbes, u32 dwBitsPerSec,
+                               u32 dwFlags, u32 event_handle, mapped_u32 ppxnqos) {
+  uint32_t total = cxna + cina;
+  if (total == 0) total = 1;
+  if (ppxnqos) {
+    uint32_t sz = 8 + total * static_cast<uint32_t>(sizeof(XNQOSINFO));
+    auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sz);
+    auto qos = REX_KERNEL_MEMORY()->TranslateVirtual<XNQOS*>(qos_guest);
+    qos->count = total;
+    qos->count_pending = 0;  // all probes resolved immediately (no real network round-trip to wait on)
+    uint16_t probes = cProbes ? static_cast<uint16_t>(cProbes) : 1;
+    for (uint32_t i = 0; i < total; i++) {
+      XNQOSINFO* qi = &qos->info[i];
+      qi->flags = 0x01 | 0x02;  // COMPLETE | TARGET_CONTACTED (no data payload -> DATA_RECEIVED unset)
+      qi->reserved = 0;
+      qi->probes_xmit = probes;
+      qi->probes_recv = probes;
+      qi->data_len = 0;
+      qi->data_ptr = 0;
+      qi->rtt_min_in_msecs = 5;
+      qi->rtt_med_in_msecs = 8;
+      qi->up_bits_per_sec = 100000000;
+      qi->down_bits_per_sec = 100000000;
+    }
+    *ppxnqos = qos_guest;
+  }
+  if (event_handle) {
+    auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
+    if (ev) ev->Set(0, false);
   }
   return 0;
 }
@@ -1112,7 +1193,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
-REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
+REX_EXPORT(__imp__NetDll_XNetQosLookup, rex::kernel::xam::NetDll_XNetQosLookup_entry)
 REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
