@@ -247,6 +247,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                       uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
   auto buffer = memory_->TranslateVirtual(buffer_ptr);
+  // [COD4MP-MMBROKER] trace the session-lifecycle call sequence so we can see whether a joiner ever
+  // attempts XGISessionJoinRemote (0x000B0013) on a discovered host vs jumping straight to hosting
+  // (XSessionCreate 0x000B0010). Range = the XSession* family.
+  if (broker_on() && message >= 0x000B0010 && message <= 0x000B0020) BrokerTrace("XGI msg=0x%06X", message);
   switch (message) {
     case 0x000B0006: {
       assert_true(!buffer_length || buffer_length == 24);
