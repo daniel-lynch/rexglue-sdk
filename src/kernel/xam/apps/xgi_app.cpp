@@ -11,6 +11,7 @@
 
 #include <rex/kernel/xam/apps/xgi_app.h>
 #include <rex/logging.h>
+#include <rex/system/xthread.h>
 #include <rex/thread.h>
 
 #include <array>
@@ -32,6 +33,9 @@
 namespace rex { namespace system {
 extern uint16_t g_host_real_ports[8];
 extern int g_host_real_port_count;
+extern uint8_t g_peer_session_id[8];
+extern bool g_peer_session_id_set;
+extern uint16_t g_peer_real_port;
 }}  // namespace rex::system
 
 namespace rex {
@@ -145,6 +149,45 @@ void BrokerPublishHost(const uint8_t* guest_session_info, uint32_t open_public,
 // session) is what stays advertised.
 void BrokerRemoveHost() { BrokerTrace("REMOVE (no-op; TTL-reaped): %s", broker_own_path().c_str()); }
 
+// [COD4MP-MMBROKER] Guest return address (LR) of whoever called into this XGI op — i.e. the iw3mp
+// matchmaking function driving the create/search/delete loop. Resolve the logged VA against the binary
+// symbol table (largest sub_ <= LR) to NAME the title-side caller without gdb (the soft-MMU SIGSEGV
+// storm makes attaching impractical). 0 if no current guest thread/context.
+uint32_t GuestCallerLR() {
+  auto* t = rex::system::XThread::GetCurrentThread();
+  if (t && t->thread_state() && t->thread_state()->context())
+    return static_cast<uint32_t>(t->thread_state()->context()->lr);
+  return 0;
+}
+
+// [COD4MP-MMBROKER] Poor-man's guest backtrace: scan the guest stack (from r1 upward) for words that
+// land in the title .text range (saved return addresses from __savegprlr_*). Resolve the logged VAs
+// offline against the binary's sub_ symbols to reconstruct the live call chain into this XGI op —
+// the gdb substitute for "who decided to do this". Logs to trace.log. Cheap when called on rare ops.
+void BrokerTraceGuestStack(memory::Memory* mem, const char* tag) {
+  auto* t = rex::system::XThread::GetCurrentThread();
+  if (!t || !t->thread_state() || !t->thread_state()->context()) return;
+  uint32_t sp = static_cast<uint32_t>(t->thread_state()->context()->r1.u32);
+  if (sp < 0x10000u || sp >= 0x90000000u) return;
+  std::string line = "GUESTSTACK ";
+  line += tag;
+  line += ":";
+  char buf[16];
+  uint32_t found = 0;
+  for (uint32_t off = 0; off < 0x400 && found < 24; off += 4) {  // walk 1KB of stack
+    uint32_t va = sp + off;
+    uint8_t* p = mem->TranslateVirtual(va);
+    if (!p) break;
+    uint32_t w = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];  // BE
+    if (w >= 0x82000000u && w < 0x82400000u) {  // title .text
+      std::snprintf(buf, sizeof buf, " %08X", w);
+      line += buf;
+      found++;
+    }
+  }
+  BrokerTrace("%s", line.c_str());
+}
+
 // Direct file trace (bypasses REXKRNL_DEBUG log-level gating) so the cross-instance flow is observable
 // during bring-up. Appends to <registry>/trace.log. Always on when the broker is on; cheap.
 void BrokerTrace(const char* fmt, ...) {
@@ -188,6 +231,18 @@ std::vector<BrokerEntry> BrokerReadHosts() {
   }
   ::closedir(d);
   return out;
+}
+
+// Pick the single freshest discovered peer host (the join target). Returns false if none. Used by the
+// GUEST branch of XSessionCreate so a joining instance adopts the HOST's address instead of its own.
+bool BrokerPickHost(BrokerEntry& out) {
+  std::vector<BrokerEntry> hosts = BrokerReadHosts();
+  if (hosts.empty()) return false;
+  size_t best = 0;
+  for (size_t i = 1; i < hosts.size(); i++)
+    if (hosts[i].ts > hosts[best].ts) best = i;
+  out = hosts[best];
+  return true;
 }
 
 // Write the discovered hosts into the title's results buffer as XSESSION_SEARCHRESULTs. Returns true
@@ -250,7 +305,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
   // [COD4MP-MMBROKER] trace the session-lifecycle call sequence so we can see whether a joiner ever
   // attempts XGISessionJoinRemote (0x000B0013) on a discovered host vs jumping straight to hosting
   // (XSessionCreate 0x000B0010). Range = the XSession* family.
-  if (broker_on() && message >= 0x000B0010 && message <= 0x000B0020) BrokerTrace("XGI msg=0x%06X", message);
+  if (broker_on() && message >= 0x000B0010 && message <= 0x000B0020)
+    BrokerTrace("XGI msg=0x%06X caller_lr=%08X", message, GuestCallerLR());
   switch (message) {
     case 0x000B0006: {
       assert_true(!buffer_length || buffer_length == 24);
@@ -312,7 +368,34 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // self-consistent (no real online routing). XSESSION_INFO (60B): XNKID sessionID @+0 (8),
       // XNADDR hostAddress @+8 (36: ina@+8, inaOnline@+12, wPortOnline@+16, abEnet@+18, abOnline@+24),
       // XNKEY keyExchangeKey @+44 (16).
-      if (session_info_ptr) {
+      // [COD4MP-MMBROKER] HOST vs GUEST is the low bit of `flags` (XSESSION_CREATE_HOST=0x001). The host-
+      // fallback path creates with HOST set (observed flags=0x3F); a joiner creates a GUEST session with
+      // HOST clear (observed flags=0x3E) right after its search finds a peer. The title reads the address
+      // it connects to FROM this session's host XNADDR — so a GUEST must adopt the DISCOVERED host's
+      // XSESSION_INFO, not stamp its own (doing the latter made the joiner resolve+connect to ITSELF and
+      // loop forever; trace-proven: joiner called XNetXnAddrToInAddr 1072x on its own xnkid, never A's).
+      const bool is_host = (flags & 0x1) != 0;
+      BrokerEntry join_target{};
+      const bool joining = broker_on() && !is_host && BrokerPickHost(join_target);
+      if (session_info_ptr && joining) {
+        // GUEST: adopt the host A's published XSESSION_INFO (xnkid + host XNADDR w/ A's real wPortOnline +
+        // XNKEY), so the subsequent XNetXnAddrToInAddr resolves A's loopback socket and the netchannel
+        // connects OUT to A instead of to ourselves.
+        uint8_t* si = memory_->TranslateVirtual(session_info_ptr);
+        std::memcpy(si, join_target.info, kSessionInfoSize);
+        uint16_t hp = (uint16_t)((join_target.info[16] << 8) | join_target.info[17]);
+        // [COD4MP-MMBROKER] remember the host's REAL OS port (for SendTo port-remap) and its XNKID (so
+        // XnAddrToInAddr returns 127.0.0.2 for THIS peer only, 127.0.0.1 for our own/local sessions).
+        rex::system::g_peer_real_port = hp;
+        std::memcpy(rex::system::g_peer_session_id, join_target.info, 8);
+        rex::system::g_peer_session_id_set = true;
+        BrokerTrace(
+            "XSessionCreate: GUEST adopt host xnkid=%02X%02X%02X%02X%02X%02X%02X%02X wPortOnline=%u "
+            "flags=0x%08X (HOST=0)",
+            join_target.info[0], join_target.info[1], join_target.info[2], join_target.info[3],
+            join_target.info[4], join_target.info[5], join_target.info[6], join_target.info[7],
+            (unsigned)hp, flags);
+      } else if (session_info_ptr) {
         uint8_t* si = memory_->TranslateVirtual(session_info_ptr);
         std::memset(si, 0, 60);
         // [COD4MP-MMBROKER] UNIQUE XNKID per host process. Was a shared static constant — so every
@@ -328,11 +411,20 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           return id;
         }();
         std::memcpy(si + 0, kSessionId.data(), 8);          // XNKID (unique per host process)
+        // [COD4MP-MMBROKER] Session ina MUST be 127.0.0.1: the title reads its OWN session's raw ina
+        // during the MMHOST loopback self-join and a non-127.0.0.1 self-ina crashes host startup
+        // (reproduced). The self-vs-peer routing is done entirely in XnAddrToInAddr (self -> 127.0.0.1
+        // via xnkid match; peer -> 127.0.0.2 via the 127.0.0.1->127.0.0.2 substitution), so the stored
+        // ina stays the universal loopback sentinel.
         si[8] = 127; si[9] = 0; si[10] = 0; si[11] = 1;     // ina = 127.0.0.1
         si[12] = 127; si[13] = 0; si[14] = 0; si[15] = 1;   // inaOnline = 127.0.0.1
-        static const uint8_t kMac[6] = {0x00, 0x15, 0x5D, 0x00, 0x00, 0x01};
-        std::memcpy(si + 18, kMac, 6);                      // abEnet (nonzero MAC)
-        si[24] = 0x01;                                      // abOnline (nonzero)
+        // [COD4MP-MMBROKER] UNIQUE per-instance hardware/online identity. Was a fixed MAC + fixed
+        // abOnline on EVERY instance, so the title saw A and B as the SAME machine and never seated the
+        // joiner as a distinct lobby member (roster stuck at 1/58). Derive from the per-process session
+        // id so two instances on one box differ.
+        si[18] = 0x00; si[19] = 0x15; si[20] = 0x5D;        // abEnet OUI (Hyper-V)
+        si[21] = kSessionId[5]; si[22] = kSessionId[6]; si[23] = kSessionId[7];  // ...unique NIC bytes
+        for (int i = 0; i < 20; i++) si[24 + i] = kSessionId[i % 8] ^ (uint8_t)(0x5A + i);  // abOnline (unique)
         for (int i = 0; i < 16; i++) si[44 + i] = static_cast<uint8_t>(0xA0 + i);  // XNKEY (nonzero)
         // [COD4MP-MMBROKER] stamp the host's REAL game-socket OS port into wPortOnline so a joining
         // peer reaches THIS process's actual loopback socket (the guest's Xbox port is ephemeral-
@@ -348,19 +440,20 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         si[17] = static_cast<uint8_t>(hport & 0xFF);
         BrokerTrace(
             "XSessionCreate: OWN xnkid=%02X%02X%02X%02X%02X%02X%02X%02X port idx=%d -> wPortOnline=%u "
-            "(of %d sockets)",
+            "(of %d sockets) | flags=0x%08X HOST=%d slots_pub=%u slots_priv=%u",
             si[0], si[1], si[2], si[3], si[4], si[5], si[6], si[7], pidx, (unsigned)hport,
-            rex::system::g_host_real_port_count);
+            rex::system::g_host_real_port_count, flags, (flags & 0x1) ? 1 : 0,
+            num_slots_public, num_slots_private);
       }
       if (nonce_ptr) {
         static const uint8_t kNonce[8] = {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0};
         std::memcpy(memory_->TranslateVirtual(nonce_ptr), kNonce, 8);
       }
-      // [COD4MP-MMBROKER] Publish this host session so a searching peer can discover + join it. In
-      // this title only the host-fallback path reaches XSessionCreate with a session_info to fill, so
-      // a present session_info_ptr is a safe "we are hosting" trigger (don't gate on a guessed host
-      // flag bit, which would silently publish nothing if wrong; `flags`=0x{:08X} is logged above).
-      if (broker_on() && session_info_ptr) {
+      // [COD4MP-MMBROKER] Publish this host session so a searching peer can discover + join it. Gate on
+      // the HOST flag bit (0x001): trace-confirmed the joiner ALSO reaches XSessionCreate (with HOST
+      // clear, flags=0x3E) to make its guest session — publishing that would wrongly advertise the
+      // joiner as a host. Only a real host (flags HOST set, e.g. 0x3F) advertises.
+      if (broker_on() && session_info_ptr && is_host) {  // only a real HOST advertises (guests must not)
         BrokerPublishHost(memory_->TranslateVirtual(session_info_ptr), num_slots_public,
                           num_slots_private, 0, 0);
       }
@@ -375,7 +468,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
 
-      if (broker_on()) BrokerRemoveHost();  // [COD4MP-MMBROKER] stop advertising a torn-down session
+      if (broker_on()) {
+        BrokerRemoveHost();  // [COD4MP-MMBROKER] stop advertising a torn-down session
+        static int delete_stack_budget = 4;  // capture the browse-loop caller chain a few times only
+        // if (delete_stack_budget-- > 0) BrokerTraceGuestStack(memory_, "Delete"); // disabled: can fault
+      }
 
       return X_E_SUCCESS;
     }
@@ -404,6 +501,17 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t private_slots_array = memory::load_and_swap<uint32_t>(buffer + 12);
       REXKRNL_DEBUG("XGISessionJoinRemote({:08X}, {}, {:08X}, {:08X})", session_ptr, user_count,
                     xuid_array, private_slots_array);
+      if (broker_on()) {
+        // [COD4MP-MMBROKER] Trace whether the joiner ever reaches JoinRemote (the guest-join entry)
+        // and with how many remote members — distinguishes "rejected A before joining" from
+        // "joined but never connected". Dump the first XUID if present.
+        uint64_t xuid0 = (user_count && xuid_array)
+                             ? memory::load_and_swap<uint64_t>(memory_->TranslateVirtual(xuid_array))
+                             : 0;
+        BrokerTrace("JoinRemote: session=%08X user_count=%u xuid0=%016llX",
+                    session_ptr, user_count, (unsigned long long)xuid0);
+        // BrokerTraceGuestStack(memory_, "JoinRemote"); // disabled: guest-stack scan can fault
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0014: {

@@ -44,6 +44,11 @@
 #include <sys/socket.h>
 #endif
 
+namespace rex { namespace system {
+extern uint8_t g_peer_session_id[8];  // [COD4MP-MMBROKER] discovered host's XNKID (set in xgi_app adopt)
+extern bool g_peer_session_id_set;
+}}  // namespace rex::system
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -475,27 +480,30 @@ struct XnAddrStatus {
 };
 
 u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
-  // Return a real LAN address (not loopback) so System Link host-start passes the title's
-  // "is this a LAN address / active network connection" check. 192.168.1.117 = 0xC0A80175.
-  // TODO: derive dynamically via getifaddrs (primary non-loopback IPv4) instead of hardcoding.
-  addr_ptr->ina.s_addr = htonl(0xC0A80175u);
+  // [COD4MP-MMBROKER] Per-process UNIQUE machine identity. The title (RakNet-style, see the quote
+  // below) keys peers off the MAC/IP — a FIXED MAC+IP on every instance made two same-box instances
+  // look like ONE machine, so the host never seated the joiner as a distinct lobby member (roster stuck
+  // at 1/58). Derive a stable-per-process discriminator from pid+time.
+  static const uint8_t kHostByte = [] {
+    uint64_t s = (static_cast<uint64_t>(getpid()) << 16) ^ static_cast<uint64_t>(::time(nullptr));
+    uint8_t b = static_cast<uint8_t>((s ^ (s >> 8) ^ (s >> 16)) & 0xFF);
+    return b ? b : 0x33;  // never 0
+  }();
+  // Unique LAN IP per instance (192.168.1.X) so it's still a valid private address for the LAN check.
+  uint32_t lan = 0xC0A80100u | (uint32_t)(0x02 + (kHostByte % 200));  // 192.168.1.[2..201]
+  addr_ptr->ina.s_addr = htonl(lan);
   addr_ptr->inaOnline.s_addr = 0;
   addr_ptr->wPortOnline = 0;
 
-  // TODO(gibbed): A proper mac address.
-  // RakNet's 360 version appears to depend on abEnet to create "random" 64-bit
-  // numbers. A zero value will cause RakPeer::Startup to fail. This causes
-  // 58411436 to crash on startup.
-  // The 360-specific code is scrubbed from the RakNet repo, but there's still
-  // traces of what it's doing which match the game code.
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L382
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4527
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4467
-  // "Mac address is a poor solution because you can't have multiple connections
-  // from the same system"
-  std::memset(addr_ptr->abEnet, 0xCC, 6);
+  // RakNet's 360 version depends on abEnet to create "random" 64-bit numbers; a zero value fails
+  // RakPeer::Startup. "Mac address is a poor solution because you can't have multiple connections from
+  // the same system" — so make it UNIQUE per instance (00:15:5D OUI + per-process bytes).
+  uint8_t mac[6] = {0x00, 0x15, 0x5D, kHostByte,
+                    static_cast<uint8_t>(kHostByte ^ 0xA5), static_cast<uint8_t>(kHostByte + 0x11)};
+  std::memcpy(addr_ptr->abEnet, mac, 6);
 
   std::memset(addr_ptr->abOnline, 0, 20);
+  addr_ptr->abOnline[0] = kHostByte;  // unique online id byte
 
   // Report a fully-configured wired LAN (ethernet present, has IP, gateway, DNS) — what a real
   // console on a LAN (no Live) returns. STATIC alone reads as "not properly connected" to the
@@ -512,7 +520,7 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
     return v && v[0] && v[0] != '0';
   }();
   if (live) {
-    addr_ptr->inaOnline.s_addr = htonl(0xC0A80175u);
+    addr_ptr->inaOnline.s_addr = htonl(lan);  // unique per instance (was fixed -> same-machine collision)
     st |= XnAddrStatus::XNET_GET_XNADDR_ONLINE;
   }
   netlog("XNetGetTitleXnAddr", st);
@@ -569,15 +577,30 @@ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mappe
     peer_inaonline = xn_addr->inaOnline.s_addr;
     peer_port = xn_addr->wPortOnline;
   }
-  if (in_addr) {
-    uint8_t lo[4] = {127, 0, 0, 1};
-    std::memcpy(REX_KERNEL_MEMORY()->TranslateVirtual(in_addr.guest_address()), lo, 4);
-  }
   uint8_t xk[8] = {0};
   if (xid) std::memcpy(xk, REX_KERNEL_MEMORY()->TranslateVirtual(xid.guest_address()), 8);
-  NetTrace("XNetXnAddrToInAddr: xnkid=%02X%02X%02X%02X%02X%02X%02X%02X ina=%08X port=%u -> 127.0.0.1",
+  if (in_addr) {
+    // [COD4MP-MMBROKER] Self vs PEER, robustly: default 127.0.0.1 (what the title needs for its OWN
+    // session — the MMHOST host self-join CRASHES if its own session resolves to non-127.0.0.1; and a
+    // null/own xid here means "self"). Return 127.0.0.2 ONLY for the explicitly DISCOVERED remote peer
+    // (the host this instance adopted; its xnkid is recorded in g_peer_session_id) — that dodges the IW3
+    // connection-SM self-check (sub_822B9598 byte-exact ==127.0.0.1 -> "local" -> loops "Trying to join")
+    // so the joiner attempts the real connection. (Was returning 127.0.0.2 for self -> host boot crash.)
+    uint32_t out = 0x0100007Fu;  // 127.0.0.1 (self/local)
+    if (rex::system::g_peer_session_id_set &&
+        std::memcmp(xk, rex::system::g_peer_session_id, 8) == 0)
+      out = 0x0200007Fu;  // 127.0.0.2 (the discovered remote peer)
+    std::memcpy(REX_KERNEL_MEMORY()->TranslateVirtual(in_addr.guest_address()), &out, 4);
+  }
+  // [COD4MP-MMBROKER] caller LR: the title re-resolves the peer addr every tick while "Trying to join"
+  // but never sends — log who's calling so we can read that connection-establishment loop (resolve VA
+  // vs `nm cod4_mp` sub_ table).
+  uint32_t lr = 0;
+  if (auto* t = XThread::GetCurrentThread(); t && t->thread_state() && t->thread_state()->context())
+    lr = static_cast<uint32_t>(t->thread_state()->context()->lr);
+  NetTrace("XNetXnAddrToInAddr: xnkid=%02X%02X%02X%02X%02X%02X%02X%02X ina=%08X port=%u -> 127.0.0.1 caller_lr=%08X",
            xk[0], xk[1], xk[2], xk[3], xk[4], xk[5], xk[6], xk[7], rex::byte_swap(peer_ina),
-           (unsigned)peer_port);
+           (unsigned)peer_port, lr);
   return 0;
 }
 
@@ -586,6 +609,32 @@ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mappe
 u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
                                     mapped_void xid) {
   return 1;
+}
+
+// [COD4MP-MMBROKER] Secure peer-link establishment. On 360, after XSessionJoinRemote registers a
+// remote member, the title calls XNetConnect(peerIna) to start the XNet secure handshake, then polls
+// XNetGetConnectStatus(peerIna) until it returns CONNECTED — only then does the matchmaking SM mark
+// the member "connected" and complete the Find-Match JOIN. Both were STUBs (XNetGetConnectStatus left
+// r3 undefined), so the member never became connected and the joiner looped forever in "Trying to
+// join potential match" (trace-proven: no QoS/RegisterKey/connect, the SM waits on this signal). We
+// have no real secure channel (loopback file-broker), so report the link up immediately.
+// XNetRegisterKey(pxnkid, pxnkey): registers a session's security association so the peer's secure
+// address resolves + the link can form. Prerequisite to XNetConnect; was a STUB (undefined r3) which
+// could make the title treat key registration as failed and never reach the connect. Report success.
+u32 NetDll_XNetRegisterKey_entry(u32 caller, mapped_void xnkid, mapped_void xnkey) {
+  NetTrace("XNetRegisterKey -> 0 (faked)");
+  return 0;
+}
+
+u32 NetDll_XNetConnect_entry(u32 caller, u32 ina) {
+  NetTrace("XNetConnect: ina=%08X -> 0 (faked secure link initiated)", rex::byte_swap(ina));
+  return 0;  // success: connection initiated
+}
+
+// XNET_CONNECT_STATUS: 0=IDLE, 1=PENDING, 2=CONNECTED, 3=LOST. Report CONNECTED so the join completes.
+u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 ina) {
+  NetTrace("XNetGetConnectStatus: ina=%08X -> 2 (CONNECTED)", rex::byte_swap(ina));
+  return 2;
 }
 
 // https://www.google.com/patents/WO2008112448A1?cl=en

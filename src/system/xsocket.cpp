@@ -45,6 +45,40 @@ namespace rex::system {
 uint16_t g_host_real_ports[8] = {0};
 int g_host_real_port_count = 0;
 
+// [COD4MP-MMBROKER] The DISCOVERED remote host's XNKID (set when this instance adopts a host as a guest
+// in xgi_app XSessionCreate). XnAddrToInAddr returns 127.0.0.2 only for THIS xnkid (the peer) and
+// 127.0.0.1 for everything else (self/local) — the title's own session must resolve to 127.0.0.1.
+uint8_t g_peer_session_id[8] = {0};
+bool g_peer_session_id_set = false;
+
+// [COD4MP-MMBROKER] The joined host peer's REAL OS port (advertised wPortOnline), captured when this
+// instance adopts a discovered host (xgi_app guest XSessionCreate). The title sends to the peer's FIXED
+// guest port (e.g. 59395) at the peer sentinel IP 127.0.0.x (x!=1); SendTo rewrites that to
+// 127.0.0.1:<g_peer_real_port> so packets actually reach the host's loopback socket on the same box.
+uint16_t g_peer_real_port = 0;
+// [COD4MP-MMBROKER] The guest (Xbox) port the title sends to the peer (e.g. 59395), captured at SendTo.
+// RecvFrom rewrites the host's reply source (127.0.0.1:<real port>) back to the sentinel the title
+// expects (127.0.0.2:<this guest port>) so the joiner's netchannel accepts the reply (source must match).
+uint16_t g_peer_guest_port = 0;
+
+// [COD4MP-MMBROKER] Budgeted datagram tracer — log where this process actually sends/receives game
+// packets so we can see whether a joining peer ever attempts a netchannel connect to the host (and on
+// which port) vs being blocked upstream in the matchmaking SM. Bounded so a live match doesn't flood.
+// Toggle/scope via COD4_MM_REGISTRY (writes <registry>/nettrace.log alongside BIND/XnAddr traces).
+static void NetPktTrace(const char* dir, uint32_t be_ip, uint16_t be_port, int len) {
+  static int budget = []{ const char* b = std::getenv("COD4_MM_NETLOG_BUDGET");
+                          return (b && b[0]) ? std::atoi(b) : 400; }();
+  if (budget <= 0) return;
+  --budget;
+  const char* d = std::getenv("COD4_MM_REGISTRY");
+  std::string path = std::string(d && d[0] ? d : "/tmp/cod4_mp_sessions") + "/nettrace.log";
+  if (FILE* f = std::fopen(path.c_str(), "a")) {
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(&be_ip);  // s_addr bytes are already net order
+    std::fprintf(f, "[pid %d] PKT %s %u.%u.%u.%u:%u len=%d\n", (int)getpid(), dir,
+                 b[0], b[1], b[2], b[3], (unsigned)ntohs(be_port), len);
+    std::fclose(f);
+  }
+}
 
 XSocket::XSocket(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
 
@@ -157,6 +191,9 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
+  // NOTE: do NOT pin to a per-instance loopback IP here — a socket bound to 127.0.0.10 won't receive
+  // the host's OWN MMHOST loopback self-connect (which targets 127.0.0.1), breaking host startup.
+  // Same-box peer delivery is handled at the SendTo layer (port remap to the peer's real OS port).
   int ret = bind(native_handle_, (sockaddr*)name, name_len);
   if (ret < 0) {
     // Guest titles bind to fixed Xbox ports/addresses the host often can't grab
@@ -269,10 +306,21 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
   socklen_t nfromlen = sizeof(sockaddr_in);
   int ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
                      (sockaddr*)&nfrom, &nfromlen);
+  if (ret > 0) NetPktTrace("RECVFROM", nfrom.sin_addr.s_addr, nfrom.sin_port, ret);  // [COD4MP-MMBROKER]
   if (from) {
     from->sin_family = nfrom.sin_family;
-    from->sin_addr = ntohl(nfrom.sin_addr.s_addr);  // BE <- BE
-    from->sin_port = nfrom.sin_port;
+    uint32_t src_ip = ntohl(nfrom.sin_addr.s_addr);  // host order, e.g. 0x7F0000xx
+    uint16_t src_port = ntohs(nfrom.sin_port);
+    // [COD4MP-MMBROKER] Reverse of the SendTo remap: a reply from the peer host arrives from
+    // 127.0.0.1:<its real OS port>, but the joiner's netchannel expects it from the sentinel it sent to
+    // (127.0.0.2:<guest port>) and drops a source mismatch. Rewrite it back so the handshake completes.
+    if (g_peer_real_port && src_ip == 0x7F000001u && src_port == g_peer_real_port) {
+      from->sin_addr = 0x7F000002u;                   // 127.0.0.2 (host order, the peer sentinel)
+      from->sin_port = htons(g_peer_guest_port);      // the guest port the title sent to
+    } else {
+      from->sin_addr = src_ip;
+      from->sin_port = nfrom.sin_port;
+    }
     std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
   }
 
@@ -302,11 +350,23 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
 
   sockaddr_in nto;
   if (to) {
-    nto.sin_addr.s_addr = to->sin_addr;
     nto.sin_family = to->sin_family;
     nto.sin_port = to->sin_port;
+    // [COD4MP-MMBROKER] The guest hands sin_addr in HOST byte order (RecvFrom stores it via ntohl), so
+    // convert to network order for the host sendto — without this the host's reply to a joiner goes out
+    // as the byte-flipped 1.0.0.127 and never arrives. (host order: 127 is the HIGH byte, e.g. 0x7F0000xx)
+    uint32_t hip = to->sin_addr;
+    nto.sin_addr.s_addr = htonl(hip);
+    // Same-box peer delivery: the joiner sends to the peer sentinel 127.0.0.x (x!=1) at the peer's FIXED
+    // guest port; the host's socket was ephemeral-remapped, so rewrite to 127.0.0.1:<host real port>.
+    if (g_peer_real_port && ((hip >> 24) & 0xFF) == 127 && (hip & 0xFF) != 1) {
+      g_peer_guest_port = ntohs(to->sin_port);    // remember the guest port for the RecvFrom rewrite
+      nto.sin_addr.s_addr = htonl(0x7F000001u);   // 127.0.0.1
+      nto.sin_port = htons(g_peer_real_port);     // host's real OS port
+    }
   }
 
+  if (to) NetPktTrace("SENDTO", nto.sin_addr.s_addr, nto.sin_port, (int)buf_len);  // [COD4MP-MMBROKER]
   return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
                 to ? (sockaddr*)&nto : nullptr, to_len);
 }
