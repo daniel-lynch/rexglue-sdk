@@ -949,10 +949,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                       pc > 2 ? join_target.host_real_ports[2] : 0);
         }
         BrokerTrace(
-            "XSessionCreate: GUEST adopt host xnkid=%02X%02X%02X%02X%02X%02X%02X%02X wPortOnline=%u "
-            "flags=0x%08X (HOST=0)",
+            "XSessionCreate: GUEST adopt host xnkid=%02X%02X%02X%02X%02X%02X%02X%02X "
+            "host_ina=%u.%u.%u.%u:%u (this is who the joiner will try to connect to) flags=0x%08X (HOST=0)",
             join_target.info[0], join_target.info[1], join_target.info[2], join_target.info[3],
             join_target.info[4], join_target.info[5], join_target.info[6], join_target.info[7],
+            join_target.info[8], join_target.info[9], join_target.info[10], join_target.info[11],
             (unsigned)hp, flags);
       } else if (session_info_ptr) {
         uint8_t* si = memory_->TranslateVirtual(session_info_ptr);
