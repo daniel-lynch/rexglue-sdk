@@ -15,18 +15,55 @@
 #include <rex/thread.h>
 
 #include <array>
+#include <chrono>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <iterator>
+#include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
-#include <dirent.h>
+#include <rex/platform.h>
+
 #include <sys/stat.h>
+#if REX_PLATFORM_WIN32
+#include <WinSock2.h>
+#include <WS2tcpip.h>
+#include <direct.h>
+#include <process.h>
+#else
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#endif
+
+// [COD4MP-MMNETBROKER] Cross-platform shims so the matchmaking broker compiles + runs on Windows-Clang
+// (the friend-test target) as well as Linux. The file-registry path is POSIX-only and stays so; the
+// network-broker path (below) is what Windows uses.
+#if REX_PLATFORM_WIN32
+using mm_sock_t = SOCKET;
+using mm_socklen_t = int;
+#define MM_INVALID_SOCK INVALID_SOCKET
+#define mm_closesock ::closesocket
+static inline int mm_pid() { return (int)::_getpid(); }
+static inline void mm_mkdir(const char* p) { ::_mkdir(p); }
+#else
+using mm_sock_t = int;
+using mm_socklen_t = socklen_t;
+#define MM_INVALID_SOCK (-1)
+#define mm_closesock ::close
+static inline int mm_pid() { return (int)::getpid(); }
+static inline void mm_mkdir(const char* p) { ::mkdir(p, 0777); }
+#endif
 
 // [COD4MP-MMBROKER] this process's game-socket real OS ports (defined in src/system/xsocket.cpp), so
 // XSessionCreate can advertise the host's actual loopback port to a joining peer.
@@ -117,23 +154,60 @@ bool broker_on() {
 
 std::string broker_dir() {
   if (const char* d = std::getenv("COD4_MM_REGISTRY"); d && d[0]) return d;
+#if REX_PLATFORM_WIN32
+  if (const char* t = std::getenv("TEMP"); t && t[0]) return std::string(t) + "\\cod4_mp_sessions";
+  return ".";  // last resort: next to the exe (trace.log only — net broker needs no shared dir)
+#else
   return "/tmp/cod4_mp_sessions";
+#endif
 }
 
 std::string broker_own_path() {
-  return broker_dir() + "/" + std::to_string((int)getpid()) + ".session";
+  return broker_dir() + "/" + std::to_string((int)mm_pid()) + ".session";
 }
 
-void BrokerTrace(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void BrokerTrace(const char* fmt, ...)
+#if !REX_PLATFORM_WIN32
+    __attribute__((format(printf, 1, 2)))
+#endif
+    ;
+
+// ===========================================================================
+// [COD4MP-MMNETBROKER] Network-transport broker (no shared filesystem).
+//
+// The file broker above needs a folder BOTH instances can read+write — fine same-box, but across two real
+// machines (e.g. friends over a VPN) it means an SMB share. When COD4_MM_PEERS is set, we instead gossip the
+// exact same session/arbitration records over UDP straight to the listed peers: each instance runs ONE
+// background thread that listens on COD4_MM_BROKER_PORT and caches what peers send, and heartbeats its own
+// current records to every peer. The in-memory cache is then the source of truth for BrokerReadHosts /
+// ArbReadAll — so the rest of the matchmaking logic is unchanged; only the transport differs.
+//
+// Records are sent as raw structs (both peers are little-endian x86-64 PCs building the same source); the
+// receiver validates magic + length and drops anything malformed or self-originated.
+// ===========================================================================
+bool broker_net_on() {
+  const char* v = std::getenv("COD4_MM_PEERS");
+  return v && v[0];
+}
+uint16_t broker_net_port() {
+  if (const char* p = std::getenv("COD4_MM_BROKER_PORT"); p && p[0]) {
+    int v = std::atoi(p);
+    if (v > 0 && v < 65536) return (uint16_t)v;
+  }
+  return 31100;  // broker rendezvous port (distinct from the title's 59395 / 62723 / 59651)
+}
+// Forward decls — definitions live at the end of this namespace (they need ArbEntry, declared further down).
+void NetEnsureStarted();
+void NetPublishSession(const BrokerEntry& e);
+std::vector<BrokerEntry> NetReadSessions();
 
 void BrokerPublishHost(const uint8_t* guest_session_info, uint32_t open_public,
                        uint32_t open_private, uint32_t filled_public, uint32_t filled_private) {
   std::string dir = broker_dir();
-  ::mkdir(dir.c_str(), 0777);
   BrokerEntry e{};
   e.magic = kBrokerMagic;
   e.version = 2;
-  e.pid = (int)getpid();
+  e.pid = (int)mm_pid();
   e.ts = (int64_t)::time(nullptr);
   std::memcpy(e.info, guest_session_info, kSessionInfoSize);
   e.open_public = open_public;
@@ -149,6 +223,17 @@ void BrokerPublishHost(const uint8_t* guest_session_info, uint32_t open_public,
     e.host_guest_ports[i] = rex::system::g_host_guest_ports[i];
     e.host_real_ports[i] = rex::system::g_host_real_ports[i];
   }
+  if (broker_net_on()) {  // network broker: hand our record to the gossip thread, no files
+    NetEnsureStarted();
+    NetPublishSession(e);
+    REXKRNL_DEBUG("[MMNETBROKER] published host session pid={} open_pub={}", e.pid, open_public);
+    BrokerTrace("PUBLISH(net): open_pub=%u open_priv=%u", open_public, open_private);
+    return;
+  }
+#if REX_PLATFORM_WIN32
+  (void)dir;  // file-registry mode is POSIX-only — Windows uses COD4_MM_PEERS (network broker) above
+#else
+  ::mkdir(dir.c_str(), 0777);
   std::string path = broker_own_path();
   std::string tmp = path + ".tmp";
   if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
@@ -158,6 +243,7 @@ void BrokerPublishHost(const uint8_t* guest_session_info, uint32_t open_public,
   }
   REXKRNL_DEBUG("[MMBROKER] published host session pid={} open_pub={}", e.pid, open_public);
   BrokerTrace("PUBLISH: open_pub=%u open_priv=%u", open_public, open_private);
+#endif
 }
 
 // NOTE: a single instance creates MULTIPLE sessions over a Find-Match flow (a transient search session
@@ -213,7 +299,7 @@ void BrokerTrace(const char* fmt, ...) {
   std::string path = broker_dir() + "/trace.log";
   FILE* f = std::fopen(path.c_str(), "a");
   if (!f) return;
-  std::fprintf(f, "[pid %d t %ld] ", (int)getpid(), (long)::time(nullptr));
+  std::fprintf(f, "[pid %d t %ld] ", (int)mm_pid(), (long)::time(nullptr));
   va_list ap;
   va_start(ap, fmt);
   std::vfprintf(f, fmt, ap);
@@ -224,11 +310,18 @@ void BrokerTrace(const char* fmt, ...) {
 
 // Collect live host sessions published by OTHER instances (skip our own pid + stale entries).
 std::vector<BrokerEntry> BrokerReadHosts() {
+  if (broker_net_on()) {  // network broker: peers came in over UDP, not from disk
+    NetEnsureStarted();
+    return NetReadSessions();
+  }
+#if REX_PLATFORM_WIN32
+  return {};  // file-registry mode is POSIX-only; Windows uses the network broker
+#else
   std::vector<BrokerEntry> out;
   std::string dir = broker_dir();
   DIR* d = ::opendir(dir.c_str());
   if (!d) return out;
-  int32_t self = (int)getpid();
+  int32_t self = (int)mm_pid();
   int64_t now = (int64_t)::time(nullptr);
   while (dirent* de = ::readdir(d)) {
     const char* nm = de->d_name;
@@ -250,6 +343,7 @@ std::vector<BrokerEntry> BrokerReadHosts() {
   }
   ::closedir(d);
   return out;
+#endif
 }
 
 // Pick the single freshest discovered peer host (the join target). Returns false if none. Used by the
@@ -281,6 +375,10 @@ struct ArbEntry {
   uint64_t machine_id;
   uint64_t xuid;
 };
+
+// [COD4MP-MMNETBROKER] arb-side gossip hooks (definitions at end of namespace, alongside the session ones).
+void NetPublishArb(const ArbEntry& e);
+std::vector<ArbEntry> NetReadArb(const uint8_t session_key[8]);
 
 // The MATCH-HOST session id. Both instances must agree on ONE key or aggregation can't pair them. Because
 // each instance adopts the OTHER as a host too (g_peer_session_id ends up = the peer's id), we can't use
@@ -327,21 +425,26 @@ bool ArbSessionKey(uint8_t out[8]) {
 // Stable per-process machine id (consistent with the per-instance abEnet/abOnline uniqueness we stamp into
 // each session's XNADDR). Pid-derived 48-bit value under the Hyper-V OUI 00:15:5D.
 uint64_t ArbLocalMachineId() {
-  return 0x0000'0015'5D00'0000ull | (static_cast<uint64_t>(getpid()) & 0x00FF'FFFFull);
+  return 0x0000'0015'5D00'0000ull | (static_cast<uint64_t>(mm_pid()) & 0x00FF'FFFFull);
 }
 
 std::string arb_own_path() {
-  return broker_dir() + "/arb_" + std::to_string((int)getpid()) + ".reg";
+  return broker_dir() + "/arb_" + std::to_string((int)mm_pid()) + ".reg";
 }
 
 void ArbPublish(const uint8_t session_key[8], uint64_t machine_id, uint64_t xuid) {
   ArbEntry e{};
   e.magic = kArbMagic;
-  e.pid = (int)getpid();
+  e.pid = (int)mm_pid();
   e.ts = (int64_t)::time(nullptr);
   std::memcpy(e.session_xnkid, session_key, 8);
   e.machine_id = machine_id;
   e.xuid = xuid;
+  if (broker_net_on()) {  // network broker: gossip our registration to peers
+    NetEnsureStarted();
+    NetPublishArb(e);
+    return;
+  }
   std::string path = arb_own_path();
   std::string tmp = path + ".tmp";
   if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
@@ -353,6 +456,13 @@ void ArbPublish(const uint8_t session_key[8], uint64_t machine_id, uint64_t xuid
 
 // All live registrants for this session (incl. our own), deduped by machine id.
 std::vector<ArbEntry> ArbReadAll(const uint8_t session_key[8]) {
+  if (broker_net_on()) {  // network broker: registrants arrived over UDP (NetReadArb includes our own)
+    NetEnsureStarted();
+    return NetReadArb(session_key);
+  }
+#if REX_PLATFORM_WIN32
+  return {};  // file-registry mode is POSIX-only; Windows uses the network broker
+#else
   std::vector<ArbEntry> out;
   std::string dir = broker_dir();
   DIR* d = ::opendir(dir.c_str());
@@ -377,6 +487,7 @@ std::vector<ArbEntry> ArbReadAll(const uint8_t session_key[8]) {
   }
   ::closedir(d);
   return out;
+#endif
 }
 
 // Write an XSESSION_REGISTRATION_RESULTS into the title's pre-sized results buffer. Layout (big-endian
@@ -455,6 +566,220 @@ bool BrokerWriteSearchResults(memory::Memory* mem, uint32_t search_results_ptr,
   }
   BrokerTrace("SEARCH: RETURNED %u host session(s) to title (fit=%u)", count, fit);
   return true;
+}
+
+// ===========================================================================
+// [COD4MP-MMNETBROKER] UDP gossip transport — implementation.
+// ===========================================================================
+struct NetPeer { uint32_t ip_be; uint16_t port; };
+
+std::vector<NetPeer> broker_net_peers() {
+  std::vector<NetPeer> out;
+  const char* v = std::getenv("COD4_MM_PEERS");
+  if (!v || !v[0]) return out;
+  uint16_t defport = broker_net_port();
+  std::string s = v;
+  size_t i = 0;
+  while (i < s.size()) {
+    size_t c = s.find(',', i);
+    std::string tok = s.substr(i, c == std::string::npos ? std::string::npos : c - i);
+    i = (c == std::string::npos) ? s.size() : c + 1;
+    while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t')) tok.erase(tok.begin());
+    while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t')) tok.pop_back();
+    if (tok.empty()) continue;
+    uint16_t port = defport;
+    std::string ipstr = tok;
+    if (size_t colon = tok.find(':'); colon != std::string::npos) {
+      ipstr = tok.substr(0, colon);
+      port = (uint16_t)std::atoi(tok.c_str() + colon + 1);
+    }
+    in_addr a{};
+    if (::inet_pton(AF_INET, ipstr.c_str(), &a) == 1) out.push_back({(uint32_t)a.s_addr, port});
+  }
+  return out;
+}
+
+// In-memory store: peer records received over UDP, plus our own current records to heartbeat out.
+struct NetStore {
+  std::mutex mu;
+  std::map<uint64_t, BrokerEntry> sessions;  // peer host sessions, keyed by (src_ip<<32 | pid)
+  std::map<uint64_t, ArbEntry> arbs;         // peer arb registrations, same keying
+  bool have_session = false;
+  BrokerEntry self_session{};
+  bool have_arb = false;
+  ArbEntry self_arb{};
+};
+NetStore& net_store() {
+  static NetStore s;
+  return s;
+}
+
+constexpr uint32_t kWireMagic = 0x344D4D42;  // "BMM4"
+#pragma pack(push, 1)
+struct WireHdr {
+  uint32_t magic;
+  uint32_t kind;  // 1 = session (BrokerEntry), 2 = arb (ArbEntry)
+  uint32_t len;   // payload byte count
+};
+#pragma pack(pop)
+
+void NetSendTo(mm_sock_t s, const std::vector<NetPeer>& peers, uint32_t kind, const void* payload,
+               uint32_t len) {
+  uint8_t pkt[2048];
+  if (sizeof(WireHdr) + len > sizeof pkt) return;
+  WireHdr h{kWireMagic, kind, len};
+  std::memcpy(pkt, &h, sizeof h);
+  std::memcpy(pkt + sizeof h, payload, len);
+  int total = (int)(sizeof h + len);
+  for (const auto& p : peers) {
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = p.ip_be;
+    to.sin_port = htons(p.port);
+    ::sendto(s, (const char*)pkt, total, 0, (sockaddr*)&to, sizeof to);
+  }
+}
+
+void NetThreadMain() {
+#if REX_PLATFORM_WIN32
+  WSADATA wsa;
+  WSAStartup(MAKEWORD(2, 2), &wsa);  // refcounted; the title already started Winsock — harmless
+#endif
+  mm_mkdir(broker_dir().c_str());  // so BrokerTrace's trace.log has somewhere to land (diagnostics only)
+  mm_sock_t s = ::socket(AF_INET, SOCK_DGRAM, 0);
+  if (s == MM_INVALID_SOCK) {
+    BrokerTrace("NETBROKER: socket() FAILED");
+    return;
+  }
+  int one = 1;
+  ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof one);
+  sockaddr_in ba{};
+  ba.sin_family = AF_INET;
+  ba.sin_addr.s_addr = htonl(INADDR_ANY);
+  ba.sin_port = htons(broker_net_port());
+  if (::bind(s, (sockaddr*)&ba, sizeof ba) != 0) {
+    BrokerTrace("NETBROKER: bind udp/%u FAILED", broker_net_port());
+    mm_closesock(s);
+    return;
+  }
+  std::vector<NetPeer> peers = broker_net_peers();
+  BrokerTrace("NETBROKER: listening udp/%u, %zu peer(s)", broker_net_port(), peers.size());
+  int32_t self = (int)mm_pid();
+  auto last_hb = std::chrono::steady_clock::now() - std::chrono::seconds(10);  // force an immediate beat
+  for (;;) {
+    fd_set rf;
+    FD_ZERO(&rf);
+    FD_SET(s, &rf);
+    timeval tv{0, 200000};  // 200ms — recv latency cap; heartbeat cadence handled separately
+    int r = ::select((int)s + 1, &rf, nullptr, nullptr, &tv);
+    if (r > 0 && FD_ISSET(s, &rf)) {
+      uint8_t buf[2048];
+      sockaddr_in from{};
+      mm_socklen_t fl = sizeof from;
+      int n = ::recvfrom(s, (char*)buf, sizeof buf, 0, (sockaddr*)&from, &fl);
+      if (n >= (int)sizeof(WireHdr)) {
+        WireHdr h;
+        std::memcpy(&h, buf, sizeof h);
+        const uint8_t* pay = buf + sizeof(WireHdr);
+        int plen = n - (int)sizeof(WireHdr);
+        uint32_t src_ip = ntohl(from.sin_addr.s_addr);
+        if (h.magic == kWireMagic && h.kind == 1 && h.len == sizeof(BrokerEntry) &&
+            plen == (int)sizeof(BrokerEntry)) {
+          BrokerEntry e;
+          std::memcpy(&e, pay, sizeof e);
+          if (e.magic == kBrokerMagic && e.pid != self) {
+            uint64_t key = ((uint64_t)src_ip << 32) | (uint32_t)e.pid;
+            std::lock_guard<std::mutex> lk(net_store().mu);
+            net_store().sessions[key] = e;
+          }
+        } else if (h.magic == kWireMagic && h.kind == 2 && h.len == sizeof(ArbEntry) &&
+                   plen == (int)sizeof(ArbEntry)) {
+          ArbEntry e;
+          std::memcpy(&e, pay, sizeof e);
+          if (e.magic == kArbMagic && e.pid != self) {
+            uint64_t key = ((uint64_t)src_ip << 32) | (uint32_t)e.pid;
+            std::lock_guard<std::mutex> lk(net_store().mu);
+            net_store().arbs[key] = e;
+          }
+        }
+      }
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (now - last_hb >= std::chrono::milliseconds(500)) {  // heartbeat our records ~2/s
+      last_hb = now;
+      int64_t ts = (int64_t)::time(nullptr);
+      BrokerEntry se{};
+      ArbEntry ae{};
+      bool hs, ha;
+      {
+        std::lock_guard<std::mutex> lk(net_store().mu);
+        hs = net_store().have_session;
+        if (hs) {
+          net_store().self_session.ts = ts;
+          se = net_store().self_session;
+        }
+        ha = net_store().have_arb;
+        if (ha) {
+          net_store().self_arb.ts = ts;
+          ae = net_store().self_arb;
+        }
+        for (auto it = net_store().sessions.begin(); it != net_store().sessions.end();)
+          it = (ts - it->second.ts > kBrokerTtlSec) ? net_store().sessions.erase(it) : std::next(it);
+        for (auto it = net_store().arbs.begin(); it != net_store().arbs.end();)
+          it = (ts - it->second.ts > kBrokerTtlSec) ? net_store().arbs.erase(it) : std::next(it);
+      }
+      if (hs) NetSendTo(s, peers, 1, &se, sizeof se);
+      if (ha) NetSendTo(s, peers, 2, &ae, sizeof ae);
+    }
+  }
+}
+
+void NetEnsureStarted() {
+  static std::once_flag once;
+  std::call_once(once, [] { std::thread(NetThreadMain).detach(); });
+}
+
+void NetPublishSession(const BrokerEntry& e) {
+  std::lock_guard<std::mutex> lk(net_store().mu);
+  net_store().self_session = e;
+  net_store().have_session = true;
+}
+
+std::vector<BrokerEntry> NetReadSessions() {
+  std::vector<BrokerEntry> out;
+  int64_t now = (int64_t)::time(nullptr);
+  std::lock_guard<std::mutex> lk(net_store().mu);
+  for (auto& kv : net_store().sessions)
+    if (now - kv.second.ts <= kBrokerTtlSec) out.push_back(kv.second);
+  return out;
+}
+
+void NetPublishArb(const ArbEntry& e) {
+  std::lock_guard<std::mutex> lk(net_store().mu);
+  net_store().self_arb = e;
+  net_store().have_arb = true;
+}
+
+std::vector<ArbEntry> NetReadArb(const uint8_t session_key[8]) {
+  std::vector<ArbEntry> out;
+  int64_t now = (int64_t)::time(nullptr);
+  std::lock_guard<std::mutex> lk(net_store().mu);
+  // our own registration counts (the host must see itself + the joiner == 2 registrants, else ARBEMPTY)
+  if (net_store().have_arb && std::memcmp(net_store().self_arb.session_xnkid, session_key, 8) == 0)
+    out.push_back(net_store().self_arb);
+  for (auto& kv : net_store().arbs) {
+    ArbEntry& e = kv.second;
+    if (now - e.ts > kBrokerTtlSec) continue;
+    if (std::memcmp(e.session_xnkid, session_key, 8) != 0) continue;
+    bool dup = false;
+    for (auto& o : out)
+      if (o.machine_id == e.machine_id) {
+        dup = true;
+        break;
+      }
+    if (!dup) out.push_back(e);
+  }
+  return out;
 }
 }  // namespace
 
@@ -594,7 +919,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         // type bits some titles check). Computed once so this process's session id stays consistent.
         static const std::array<uint8_t, 8> kSessionId = [] {
           std::array<uint8_t, 8> id{};
-          uint64_t seed = (static_cast<uint64_t>(getpid()) << 32) ^ static_cast<uint64_t>(::time(nullptr));
+          uint64_t seed = (static_cast<uint64_t>(mm_pid()) << 32) ^ static_cast<uint64_t>(::time(nullptr));
           id[0] = 0x09;
           for (int i = 1; i < 8; i++) id[i] = static_cast<uint8_t>((seed >> (8 * (i - 1))) & 0xFF);
           return id;
