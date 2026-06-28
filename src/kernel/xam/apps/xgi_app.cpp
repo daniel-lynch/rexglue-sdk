@@ -313,6 +313,15 @@ void BrokerTrace(const char* fmt, ...) {
 
 // Collect live host sessions published by OTHER instances (skip our own pid + stale entries).
 std::vector<BrokerEntry> BrokerReadHosts() {
+  // [COD4MP-MMBROKER] The designated host (COD4_MMHOST) must NEVER consume peer sessions — not for join
+  // adoption AND not as Find-Match search results. If the joiner host-falls-back and starts advertising
+  // its own game, the host's title would otherwise see "1 game found" and loop trying to JoinRemote the
+  // joiner instead of spawning its own match (observed: peer_hosts=1 -> endless JoinRemote, never SVPROBE).
+  // The host still PUBLISHES its own session; it just ignores everyone else's.
+  if (const char* v = std::getenv("COD4_MMHOST"); v && v[0] && v[0] != '0') {
+    if (broker_net_on()) NetEnsureStarted();  // keep the broker thread up so we still advertise + auto-learn
+    return {};
+  }
   if (broker_net_on()) {  // network broker: peers came in over UDP, not from disk
     NetEnsureStarted();
     return NetReadSessions();
