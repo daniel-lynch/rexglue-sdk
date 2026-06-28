@@ -895,8 +895,16 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // OR when this instance has already committed to A as a guest (sticky latch) — the latter forces the
       // match-start HOST=1 create to keep joining A instead of re-hosting B's own orphan session. A never
       // sets the latch (its creates are is_host with no peer found at search time), so it stays the host.
-      const bool joining =
-          broker_on() && (!is_host || g_committed_guest) && BrokerPickHost(join_target);
+      // [COD4MP-MMBROKER] The designated host (COD4_MMHOST) must NEVER adopt a discovered peer. With the
+      // broker, the host can SEE the joiner's own party-session publish (and its own session echoed back by
+      // the joiner); adopting either flips the host into a guest (STICKY-GUEST) and the match never forms.
+      // A pure joiner has no COD4_MMHOST, so it still adopts the host normally.
+      const bool am_host_process = [] {
+        const char* v = std::getenv("COD4_MMHOST");
+        return v && v[0] && v[0] != '0';
+      }();
+      const bool joining = !am_host_process && broker_on() &&
+                           (!is_host || g_committed_guest) && BrokerPickHost(join_target);
       if (session_info_ptr && joining) {
         g_committed_guest = true;
         if (is_host)
@@ -947,7 +955,17 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         // type bits some titles check). Computed once so this process's session id stays consistent.
         static const std::array<uint8_t, 8> kSessionId = [] {
           std::array<uint8_t, 8> id{};
-          uint64_t seed = (static_cast<uint64_t>(mm_pid()) << 32) ^ static_cast<uint64_t>(::time(nullptr));
+          // [COD4MP-MMBROKER] Seed primarily from COD4_LOCAL_IP — the one value GUARANTEED distinct per
+          // machine. pid+time alone collided across two real machines (NTP-synced clocks → same time bytes,
+          // and a coincident pid → identical xnkid), which made each host discover the other's session as
+          // its OWN and never form a clean host/guest split. The IP makes two machines' xnkids differ
+          // unconditionally; pid+time still disambiguate two instances on ONE box.
+          uint8_t lip[4] = {0, 0, 0, 0};
+          Cod4LocalIpBytes(lip);
+          uint32_t ipw = ((uint32_t)lip[0] << 24) | ((uint32_t)lip[1] << 16) | ((uint32_t)lip[2] << 8) |
+                         (uint32_t)lip[3];
+          uint64_t seed = ((uint64_t)ipw << 32) | (uint64_t)ipw;  // IP across both halves...
+          seed ^= ((uint64_t)mm_pid() << 16) ^ static_cast<uint64_t>(::time(nullptr));  // ...then pid+time
           id[0] = 0x09;
           for (int i = 1; i < 8; i++) id[i] = static_cast<uint8_t>((seed >> (8 * (i - 1))) & 0xFF);
           return id;
