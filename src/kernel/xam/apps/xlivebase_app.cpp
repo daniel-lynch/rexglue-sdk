@@ -85,6 +85,17 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
                     buffer_length);
       return X_E_SUCCESS;
     }
+    case 0x0005000B: {
+      // [COD4MP-LIVE/MMNETNS] Called ONCE during the in-progress match JOIN, right as B's client hits
+      // "Setting up game..." (same shape as 0x00050009 — XMsgStartIORequest overlapped, buf+40 — another
+      // Live online-storage/stats query). Left unimplemented it returns X_E_FAIL and the join-load appears
+      // to wait on the overlapped result forever (B stuck at "Setting up game", never finishes loading ->
+      // never sends begin -> stays PRIMED -> sv_timeout drop). Report empty success so the overlapped
+      // completes (length 0 = empty file -> defaults) and the client's match-load can proceed.
+      REXKRNL_DEBUG("CoD4 Live join-time query 0x0005000B ({:08X}, {:08X}) -> empty success", buffer_ptr,
+                    buffer_length);
+      return X_E_SUCCESS;
+    }
     case 0x00050009: {
       // [COD4MP-LIVE] CoD4 (IW3) routes its Xbox Live online-storage downloads
       // (motd / playlist / game-settings / stats) through this message via

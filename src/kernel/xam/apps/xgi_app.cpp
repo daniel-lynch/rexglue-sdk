@@ -32,10 +32,14 @@
 // XSessionCreate can advertise the host's actual loopback port to a joining peer.
 namespace rex { namespace system {
 extern uint16_t g_host_real_ports[8];
+extern uint16_t g_host_guest_ports[8];
 extern int g_host_real_port_count;
 extern uint8_t g_peer_session_id[8];
 extern bool g_peer_session_id_set;
 extern uint16_t g_peer_real_port;
+extern uint16_t g_peer_map_guest[8];
+extern uint16_t g_peer_map_real[8];
+extern int g_peer_map_count;
 }}  // namespace rex::system
 
 namespace rex {
@@ -98,6 +102,12 @@ struct BrokerEntry {
   uint8_t info[kSessionInfoSize];     // XSESSION_INFO exactly as it sits in guest memory (big-endian)
   uint32_t open_public, open_private;
   uint32_t filled_public, filled_private;
+  // [COD4MP-MMBROKER] v2: the host's full guest->real OS port map so a joiner routes per guest port
+  // (lobby->lobby socket, game-connect->game listen socket) instead of collapsing onto one advertised
+  // port. host_guest_ports[i] (the title's fixed Xbox port) maps to host_real_ports[i] (the OS port).
+  uint32_t port_count;
+  uint16_t host_guest_ports[8];
+  uint16_t host_real_ports[8];
 };
 
 bool broker_on() {
@@ -122,7 +132,7 @@ void BrokerPublishHost(const uint8_t* guest_session_info, uint32_t open_public,
   ::mkdir(dir.c_str(), 0777);
   BrokerEntry e{};
   e.magic = kBrokerMagic;
-  e.version = 1;
+  e.version = 2;
   e.pid = (int)getpid();
   e.ts = (int64_t)::time(nullptr);
   std::memcpy(e.info, guest_session_info, kSessionInfoSize);
@@ -130,6 +140,15 @@ void BrokerPublishHost(const uint8_t* guest_session_info, uint32_t open_public,
   e.open_private = open_private;
   e.filled_public = filled_public;
   e.filled_private = filled_private;
+  // [COD4MP-MMBROKER] v2: publish the full guest->real port map (captured at Bind) so the joiner can
+  // reach the host's GAME listen socket, not just the advertised lobby socket.
+  int pc = rex::system::g_host_real_port_count;
+  if (pc > 8) pc = 8;
+  e.port_count = (uint32_t)pc;
+  for (int i = 0; i < pc; i++) {
+    e.host_guest_ports[i] = rex::system::g_host_guest_ports[i];
+    e.host_real_ports[i] = rex::system::g_host_real_ports[i];
+  }
   std::string path = broker_own_path();
   std::string tmp = path + ".tmp";
   if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
@@ -243,6 +262,149 @@ bool BrokerPickHost(BrokerEntry& out) {
     if (hosts[i].ts > hosts[best].ts) best = i;
   out = hosts[best];
   return true;
+}
+
+// [COD4MP-MMARB] ── Session arbitration aggregation ──────────────────────────────────────────────
+// XSessionArbitrationRegister (0x000B001A): on a real 360 every machine registers with the Live
+// arbitration service for the match nonce and gets back the FULL aggregated registrant list; the host
+// then checks all expected members are arbitrated, else it aborts the match — observed on the wire as the
+// host sending the joiner `endparty XBOXLIVE_NOTREGISTEREDWITHARBITRATION`, after which it loads the map
+// solo and the joiner gets "Game lobby closed". With no Live server we aggregate via the broker dir: each
+// instance drops an arb_<pid>.reg keyed by the SHARED match-host session xnkid, then reads every live
+// registrant for that session and writes them back into the title's results buffer.
+constexpr uint32_t kArbMagic = 0x4252414D;  // "MARB"
+struct ArbEntry {
+  uint32_t magic;
+  int32_t pid;
+  int64_t ts;
+  uint8_t session_xnkid[8];   // the shared (match-host) session id this registration belongs to
+  uint64_t machine_id;
+  uint64_t xuid;
+};
+
+// The MATCH-HOST session id. Both instances must agree on ONE key or aggregation can't pair them. Because
+// each instance adopts the OTHER as a host too (g_peer_session_id ends up = the peer's id), we can't use
+// g_peer_session_id alone. The real match host (flags HOST=1) records its own xnkid here; a pure guest
+// has only g_peer_session_id (= the host's id). Preferring the local-host id resolves BOTH to A's xnkid.
+uint8_t g_local_host_xnkid[8] = {0};
+bool g_local_host_xnkid_set = false;
+
+// [COD4MP-MMBROKER] Sticky-guest latch. Once this instance has adopted a discovered host A as a GUEST
+// (the matchmaking !HOST create), it must REMAIN A's guest for every subsequent XSessionCreate — in
+// particular the match-start create, which the title issues with HOST=1 and a fresh own xnkid (observed
+// flags=0x223). Without this latch the joiner re-hosts its own game session at match start, so when A
+// migrates the party into the game the joiner is orphaned and the title shows "Game lobby closed"
+// (trace-proven: B adopts A 09197 in the lobby, then creates OWN 09547 HOST=1 at t+27s and drops).
+bool g_committed_guest = false;
+
+// [COD4MP-MMARB] Set true once XSessionStart (0x0B0014) fires. COD4_MM_ARBEMPTY returns EMPTY arbitration
+// BEFORE the match starts (so the host bails into the abort->START path instead of waiting forever for the
+// lobby countdown), then switches to the REAL aggregated registrants AFTER start — so the host's post-start
+// arbitration check sees the joiner registered and does NOT kick it with NOTREGISTEREDWITHARBITRATION.
+bool g_xsession_started = false;
+
+// [COD4MP-MMNETNS] This instance's real veth IP (host-order bytes) when running in its own network
+// namespace; 0 when unset (legacy single-loopback mode). The published session ina must be this real IP
+// so a peer in another namespace reaches it directly (no same-box port-NAT).
+static bool Cod4LocalIpBytes(uint8_t out[4]) {
+  const char* s = std::getenv("COD4_LOCAL_IP");
+  if (!s || !s[0]) return false;
+  unsigned a = 0, b = 0, c = 0, d = 0;
+  if (std::sscanf(s, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return false;
+  out[0] = (uint8_t)a; out[1] = (uint8_t)b; out[2] = (uint8_t)c; out[3] = (uint8_t)d;
+  return true;
+}
+
+bool ArbSessionKey(uint8_t out[8]) {
+  if (g_local_host_xnkid_set) { std::memcpy(out, g_local_host_xnkid, 8); return true; }  // I am the host
+  if (rex::system::g_peer_session_id_set) {                                              // I am a guest
+    std::memcpy(out, rex::system::g_peer_session_id, 8);
+    return true;
+  }
+  return false;
+}
+
+// Stable per-process machine id (consistent with the per-instance abEnet/abOnline uniqueness we stamp into
+// each session's XNADDR). Pid-derived 48-bit value under the Hyper-V OUI 00:15:5D.
+uint64_t ArbLocalMachineId() {
+  return 0x0000'0015'5D00'0000ull | (static_cast<uint64_t>(getpid()) & 0x00FF'FFFFull);
+}
+
+std::string arb_own_path() {
+  return broker_dir() + "/arb_" + std::to_string((int)getpid()) + ".reg";
+}
+
+void ArbPublish(const uint8_t session_key[8], uint64_t machine_id, uint64_t xuid) {
+  ArbEntry e{};
+  e.magic = kArbMagic;
+  e.pid = (int)getpid();
+  e.ts = (int64_t)::time(nullptr);
+  std::memcpy(e.session_xnkid, session_key, 8);
+  e.machine_id = machine_id;
+  e.xuid = xuid;
+  std::string path = arb_own_path();
+  std::string tmp = path + ".tmp";
+  if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+    std::fwrite(&e, sizeof e, 1, f);
+    std::fclose(f);
+    std::rename(tmp.c_str(), path.c_str());
+  }
+}
+
+// All live registrants for this session (incl. our own), deduped by machine id.
+std::vector<ArbEntry> ArbReadAll(const uint8_t session_key[8]) {
+  std::vector<ArbEntry> out;
+  std::string dir = broker_dir();
+  DIR* d = ::opendir(dir.c_str());
+  if (!d) return out;
+  int64_t now = (int64_t)::time(nullptr);
+  while (dirent* de = ::readdir(d)) {
+    const char* nm = de->d_name;
+    size_t L = std::strlen(nm);
+    if (L < 9 || std::strncmp(nm, "arb_", 4) != 0 || std::strcmp(nm + L - 4, ".reg") != 0) continue;
+    std::string path = dir + "/" + nm;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) continue;
+    ArbEntry e{};
+    size_t got = std::fread(&e, 1, sizeof e, f);
+    std::fclose(f);
+    if (got != sizeof e || e.magic != kArbMagic) continue;
+    if (now - e.ts > kBrokerTtlSec) { std::remove(path.c_str()); continue; }
+    if (std::memcmp(e.session_xnkid, session_key, 8) != 0) continue;
+    bool dup = false;
+    for (auto& o : out) if (o.machine_id == e.machine_id) { dup = true; break; }
+    if (!dup) out.push_back(e);
+  }
+  ::closedir(d);
+  return out;
+}
+
+// Write an XSESSION_REGISTRATION_RESULTS into the title's pre-sized results buffer. Layout (big-endian
+// guest memory): header {wNumRegistrants u32 @+0, rgRegistrants ptr u32 @+4}; then N XSESSION_REGISTRANT
+// (20B each): {qwMachineID u64 @+0, bTrustworthiness u32 @+8, bNumUsers u32 @+12, rgUsers ptr u32 @+16};
+// then the per-registrant XUID arrays (8B each). Returns the registrant count written (or -1 if it didn't
+// fit / no buffer).
+int ArbWriteResults(memory::Memory* mem, uint32_t results_ptr, uint32_t results_buffer_size,
+                    const std::vector<ArbEntry>& regs) {
+  if (!results_ptr) return -1;
+  uint32_t n = static_cast<uint32_t>(regs.size());
+  uint32_t need = 8 + n * 20 + n * 8;
+  if (need > results_buffer_size) return -1;
+  uint8_t* base_ptr = mem->TranslateVirtual(results_ptr);
+  uint32_t reg_array_va = results_ptr + 8;
+  uint32_t xuid_area_va = results_ptr + 8 + n * 20;
+  memory::store_and_swap<uint32_t>(base_ptr + 0, n);             // wNumRegistrants
+  memory::store_and_swap<uint32_t>(base_ptr + 4, n ? reg_array_va : 0);  // rgRegistrants
+  for (uint32_t i = 0; i < n; i++) {
+    uint8_t* r = base_ptr + 8 + i * 20;
+    uint32_t xuid_va = xuid_area_va + i * 8;
+    memory::store_and_swap<uint64_t>(r + 0, regs[i].machine_id);  // qwMachineID
+    memory::store_and_swap<uint32_t>(r + 8, 0);                   // bTrustworthiness
+    memory::store_and_swap<uint32_t>(r + 12, 1);                  // bNumUsers
+    memory::store_and_swap<uint32_t>(r + 16, xuid_va);            // rgUsers ptr
+    memory::store_and_swap<uint64_t>(mem->TranslateVirtual(xuid_va), regs[i].xuid);
+  }
+  return static_cast<int>(n);
 }
 
 // Write the discovered hosts into the title's results buffer as XSESSION_SEARCHRESULTs. Returns true
@@ -376,8 +538,17 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // loop forever; trace-proven: joiner called XNetXnAddrToInAddr 1072x on its own xnkid, never A's).
       const bool is_host = (flags & 0x1) != 0;
       BrokerEntry join_target{};
-      const bool joining = broker_on() && !is_host && BrokerPickHost(join_target);
+      // [COD4MP-MMBROKER] Adopt the discovered host A when the title creates a GUEST session (!is_host),
+      // OR when this instance has already committed to A as a guest (sticky latch) — the latter forces the
+      // match-start HOST=1 create to keep joining A instead of re-hosting B's own orphan session. A never
+      // sets the latch (its creates are is_host with no peer found at search time), so it stays the host.
+      const bool joining =
+          broker_on() && (!is_host || g_committed_guest) && BrokerPickHost(join_target);
       if (session_info_ptr && joining) {
+        g_committed_guest = true;
+        if (is_host)
+          BrokerTrace("STICKY-GUEST: overriding HOST=1 create (flags=0x%08X) -> stay guest of host A",
+                      flags);
         // GUEST: adopt the host A's published XSESSION_INFO (xnkid + host XNADDR w/ A's real wPortOnline +
         // XNKEY), so the subsequent XNetXnAddrToInAddr resolves A's loopback socket and the netchannel
         // connects OUT to A instead of to ourselves.
@@ -389,6 +560,24 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         rex::system::g_peer_real_port = hp;
         std::memcpy(rex::system::g_peer_session_id, join_target.info, 8);
         rex::system::g_peer_session_id_set = true;
+        // [COD4MP-MMBROKER] adopt the host's full guest->real port map so SendTo routes a game-connect
+        // (guest 59651) to the host's GAME listen socket, not the advertised lobby socket.
+        if (join_target.version >= 2) {
+          int pc = (int)join_target.port_count;
+          if (pc > 8) pc = 8;
+          rex::system::g_peer_map_count = pc;
+          for (int i = 0; i < pc; i++) {
+            rex::system::g_peer_map_guest[i] = join_target.host_guest_ports[i];
+            rex::system::g_peer_map_real[i] = join_target.host_real_ports[i];
+          }
+          BrokerTrace("GUEST adopt port-map: count=%d  [59395?]g=%u->r=%u  g=%u->r=%u  g=%u->r=%u",
+                      pc, pc > 0 ? join_target.host_guest_ports[0] : 0,
+                      pc > 0 ? join_target.host_real_ports[0] : 0,
+                      pc > 1 ? join_target.host_guest_ports[1] : 0,
+                      pc > 1 ? join_target.host_real_ports[1] : 0,
+                      pc > 2 ? join_target.host_guest_ports[2] : 0,
+                      pc > 2 ? join_target.host_real_ports[2] : 0);
+        }
         BrokerTrace(
             "XSessionCreate: GUEST adopt host xnkid=%02X%02X%02X%02X%02X%02X%02X%02X wPortOnline=%u "
             "flags=0x%08X (HOST=0)",
@@ -411,13 +600,43 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           return id;
         }();
         std::memcpy(si + 0, kSessionId.data(), 8);          // XNKID (unique per host process)
+        // [COD4MP-MMARB] Remember our own host session id so arbitration aggregation keys on the MATCH
+        // host, not the peer we may also have adopted. ONLY the real arbitrated match session qualifies
+        // (XSESSION_CREATE_USES_ARBITRATION = 0x10; the match host's flags are 0x3F). A pure joiner also
+        // runs THIS host branch for its party/private sessions (flags 0x29/0x223, no 0x10) — capturing
+        // those would make the joiner key on its OWN id and never pair with the host. Gating on 0x10
+        // means the joiner never sets this and falls through to g_peer_session_id (the adopted host id),
+        // so BOTH sides resolve to the match host's xnkid. See ArbSessionKey.
+        if (flags & 0x10) {
+          std::memcpy(g_local_host_xnkid, kSessionId.data(), 8);
+          g_local_host_xnkid_set = true;
+          // [COD4MP-MMARB] Pre-publish the host's OWN arbitration registration NOW, at arbitrated-session
+          // create — the host is definitionally arbitrated (it's hosting). The title only calls 0x0B001A
+          // at match-start, and the JOINER registers FIRST (its read then sees only itself, registrants=1,
+          // so it concludes the host isn't arbitrated and leaves the lobby with `0dis`). Writing the host's
+          // arb entry up front means a later-joining guest's one-shot read already includes the host →
+          // both sides see registrants>=2 regardless of who calls 0x0B001A first.
+          uint64_t host_xuid =
+              REX_KERNEL_STATE()->user_profile() ? REX_KERNEL_STATE()->user_profile()->xuid() : 0;
+          ArbPublish(kSessionId.data(), ArbLocalMachineId(), host_xuid);
+          BrokerTrace("ArbPrePublish (host create): key=%02X%02X%02X%02X%02X%02X%02X%02X xuid=%016llX",
+                      kSessionId[0], kSessionId[1], kSessionId[2], kSessionId[3], kSessionId[4],
+                      kSessionId[5], kSessionId[6], kSessionId[7], (unsigned long long)host_xuid);
+        }
         // [COD4MP-MMBROKER] Session ina MUST be 127.0.0.1: the title reads its OWN session's raw ina
         // during the MMHOST loopback self-join and a non-127.0.0.1 self-ina crashes host startup
         // (reproduced). The self-vs-peer routing is done entirely in XnAddrToInAddr (self -> 127.0.0.1
         // via xnkid match; peer -> 127.0.0.2 via the 127.0.0.1->127.0.0.2 substitution), so the stored
         // ina stays the universal loopback sentinel.
-        si[8] = 127; si[9] = 0; si[10] = 0; si[11] = 1;     // ina = 127.0.0.1
-        si[12] = 127; si[13] = 0; si[14] = 0; si[15] = 1;   // inaOnline = 127.0.0.1
+        uint8_t lip[4];
+        if (Cod4LocalIpBytes(lip)) {
+          // [COD4MP-MMNETNS] publish this instance's REAL veth IP so the peer reaches it directly.
+          si[8] = lip[0];  si[9] = lip[1];  si[10] = lip[2]; si[11] = lip[3];   // ina = real veth IP
+          si[12] = lip[0]; si[13] = lip[1]; si[14] = lip[2]; si[15] = lip[3];   // inaOnline = same
+        } else {
+          si[8] = 127; si[9] = 0; si[10] = 0; si[11] = 1;     // ina = 127.0.0.1 (legacy loopback)
+          si[12] = 127; si[13] = 0; si[14] = 0; si[15] = 1;   // inaOnline = 127.0.0.1
+        }
         // [COD4MP-MMBROKER] UNIQUE per-instance hardware/online identity. Was a fixed MAC + fixed
         // abOnline on EVERY instance, so the title saw A and B as the SAME machine and never seated the
         // joiner as a distinct lobby member (roster stuck at 1/58). Derive from the per-process session
@@ -522,6 +741,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
 
       REXKRNL_DEBUG("XSessionStart({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
+      g_xsession_started = true;  // [COD4MP-MMARB] after this, ARBEMPTY yields the real registrants
 
       return X_STATUS_SUCCESS;
     }
@@ -650,6 +870,38 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("XSessionArbitrationRegister({:08X}, {:08X}, {:016X}, {:08X}, {:08X}, {:08X})",
                     obj_ptr, flags, session_nonce, session_duration_sec, results_buffer_size,
                     results_ptr);
+
+      // [COD4MP-MMARB] Aggregate arbitration registrants via the broker so the host sees the joiner (and
+      // itself) registered — otherwise our empty result made the host abort the match with
+      // `endparty XBOXLIVE_NOTREGISTEREDWITHARBITRATION` and the joiner got "Game lobby closed".
+      // [COD4MP-MMARB] COD4_MM_ARBEMPTY=1 reverts to the empty-result behavior on purpose: it puts the host
+      // on the "abort -> start the match" path (the pre-fix flow that DID start + reach the game) instead of
+      // the "proper -> wait for all members ready" path that re-loops the lobby countdown forever. Pair with
+      // COD4_MM_NOKICK (xsocket.cpp) to suppress the resulting endparty so the joiner isn't dropped.
+      const char* arb_empty = std::getenv("COD4_MM_ARBEMPTY");
+      bool arb_empty_on = arb_empty && arb_empty[0] && arb_empty[0] != '0';
+      // [COD4MP-MMARB] ARBEMPTY only stays empty UNTIL the match starts; after XSessionStart, aggregate the
+      // real registrants so the host's arbitration check doesn't kick the joiner (NOTREGISTEREDWITHARBITRATION).
+      if (broker_on() && (!arb_empty_on || g_xsession_started)) {
+        uint8_t key[8];
+        if (ArbSessionKey(key)) {
+          uint64_t my_xuid =
+              REX_KERNEL_STATE()->user_profile() ? REX_KERNEL_STATE()->user_profile()->xuid() : 0;
+          uint64_t my_machine = ArbLocalMachineId();
+          ArbPublish(key, my_machine, my_xuid);
+          std::vector<ArbEntry> regs = ArbReadAll(key);
+          int wrote = ArbWriteResults(memory_, results_ptr, results_buffer_size, regs);
+          BrokerTrace("ArbitrationRegister: key=%02X%02X%02X%02X%02X%02X%02X%02X my_xuid=%016llX "
+                      "my_machine=%012llX registrants=%zu wrote=%d buf=%u",
+                      key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+                      (unsigned long long)my_xuid, (unsigned long long)my_machine, regs.size(), wrote,
+                      results_buffer_size);
+        } else {
+          BrokerTrace("ArbitrationRegister: NO SESSION KEY (host_set=%d peer_set=%d) — cannot aggregate",
+                      g_local_host_xnkid_set ? 1 : 0,
+                      rex::system::g_peer_session_id_set ? 1 : 0);
+        }
+      }
 
       return X_E_SUCCESS;
     }

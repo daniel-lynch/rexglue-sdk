@@ -479,6 +479,21 @@ struct XnAddrStatus {
   static const uint32_t XNET_GET_XNADDR_TROUBLESHOOT = 0x00008000;
 };
 
+// [COD4MP-MMNETNS] When each instance runs in its OWN network namespace (distinct real IPs over a veth
+// pair), COD4_LOCAL_IP ("10.0.0.1"/"10.0.0.2") is this instance's real interface IP. Parse it to a
+// host-order u32 so the title's own XNADDR + the published session ina reflect the real IP and peers are
+// reached directly (no same-box port-NAT/GAMEROUTE). Returns 0 when unset (legacy single-loopback mode).
+static uint32_t Cod4LocalIpHostOrder() {
+  static uint32_t ip = [] {
+    const char* s = std::getenv("COD4_LOCAL_IP");
+    if (!s || !s[0]) return 0u;
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (std::sscanf(s, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return 0u;
+    return (a << 24) | (b << 16) | (c << 8) | d;
+  }();
+  return ip;
+}
+
 u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
   // [COD4MP-MMBROKER] Per-process UNIQUE machine identity. The title (RakNet-style, see the quote
   // below) keys peers off the MAC/IP — a FIXED MAC+IP on every instance made two same-box instances
@@ -491,6 +506,9 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
   }();
   // Unique LAN IP per instance (192.168.1.X) so it's still a valid private address for the LAN check.
   uint32_t lan = 0xC0A80100u | (uint32_t)(0x02 + (kHostByte % 200));  // 192.168.1.[2..201]
+  // [COD4MP-MMNETNS] In netns mode use this instance's REAL veth IP so the title's own address matches
+  // the network it's actually on (peers then reach it directly with no NAT).
+  if (uint32_t lip = Cod4LocalIpHostOrder()) lan = lip;
   addr_ptr->ina.s_addr = htonl(lan);
   addr_ptr->inaOnline.s_addr = 0;
   addr_ptr->wPortOnline = 0;
@@ -586,11 +604,24 @@ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mappe
     // (the host this instance adopted; its xnkid is recorded in g_peer_session_id) — that dodges the IW3
     // connection-SM self-check (sub_822B9598 byte-exact ==127.0.0.1 -> "local" -> loops "Trying to join")
     // so the joiner attempts the real connection. (Was returning 127.0.0.2 for self -> host boot crash.)
-    uint32_t out = 0x0100007Fu;  // 127.0.0.1 (self/local)
-    if (rex::system::g_peer_session_id_set &&
-        std::memcmp(xk, rex::system::g_peer_session_id, 8) == 0)
-      out = 0x0200007Fu;  // 127.0.0.2 (the discovered remote peer)
+    uint32_t out = 0x0100007Fu;  // 127.0.0.1 (self/local — own-namespace loopback, self-join stays local)
+    bool peer_match = rex::system::g_peer_session_id_set &&
+                      std::memcmp(xk, rex::system::g_peer_session_id, 8) == 0;
+    if (peer_match) {
+      // [COD4MP-MMNETNS] In netns mode the peer is on a REAL distinct IP (its veth address, carried in the
+      // adopted session XNADDR ina, network order) — hand it back directly so the title connects straight
+      // to it with no port-NAT. Legacy single-loopback mode keeps the 127.0.0.2 sentinel.
+      if (Cod4LocalIpHostOrder() && peer_ina) out = peer_ina;
+      else out = 0x0200007Fu;  // 127.0.0.2 (the discovered remote peer)
+    }
     std::memcpy(REX_KERNEL_MEMORY()->TranslateVirtual(in_addr.guest_address()), &out, 4);
+    NetTrace("XnAddr RESOLVE xk=%02X%02X%02X%02X%02X%02X%02X%02X peer_id=%02X%02X%02X%02X%02X%02X%02X%02X "
+             "match=%d -> %s", xk[0], xk[1], xk[2], xk[3], xk[4], xk[5], xk[6], xk[7],
+             rex::system::g_peer_session_id[0], rex::system::g_peer_session_id[1],
+             rex::system::g_peer_session_id[2], rex::system::g_peer_session_id[3],
+             rex::system::g_peer_session_id[4], rex::system::g_peer_session_id[5],
+             rex::system::g_peer_session_id[6], rex::system::g_peer_session_id[7],
+             peer_match ? 1 : 0, peer_match ? "127.0.0.2(PEER)" : "127.0.0.1(SELF)");
   }
   // [COD4MP-MMBROKER] caller LR: the title re-resolves the peer addr every tick while "Trying to join"
   // but never sends — log who's calling so we can read that connection-establishment loop (resolve VA
@@ -1237,7 +1268,10 @@ REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
-REX_EXPORT_STUB(__imp__NetDll_XNetGetConnectStatus);
+// [COD4MP-MMBROKER] Wire the real impl (returns 2=CONNECTED). It was defined but never exported — only this
+// stub was bound, so the title saw the peer as not-connected and dropped joiners with
+// `endparty PLATFORM_DISCONNECTED_FROM_SERVER` during the in-progress join.
+REX_EXPORT(__imp__NetDll_XNetGetConnectStatus, rex::kernel::xam::NetDll_XNetGetConnectStatus_entry);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
