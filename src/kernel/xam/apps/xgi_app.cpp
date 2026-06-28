@@ -186,8 +186,11 @@ void BrokerTrace(const char* fmt, ...)
 // receiver validates magic + length and drops anything malformed or self-originated.
 // ===========================================================================
 bool broker_net_on() {
-  const char* v = std::getenv("COD4_MM_PEERS");
-  return v && v[0];
+  if (const char* v = std::getenv("COD4_MM_PEERS"); v && v[0]) return true;
+  // COD4_MM_NETBROKER=1 turns on the network broker WITHOUT a static peer list — for the host, which can
+  // learn the joiner's address from its inbound beacons (the host is the stable IP the joiner already knows).
+  if (const char* v = std::getenv("COD4_MM_NETBROKER"); v && v[0] && v[0] != '0') return true;
+  return false;
 }
 uint16_t broker_net_port() {
   if (const char* p = std::getenv("COD4_MM_BROKER_PORT"); p && p[0]) {
@@ -604,6 +607,7 @@ struct NetStore {
   std::mutex mu;
   std::map<uint64_t, BrokerEntry> sessions;  // peer host sessions, keyed by (src_ip<<32 | pid)
   std::map<uint64_t, ArbEntry> arbs;         // peer arb registrations, same keying
+  std::map<uint64_t, int64_t> learned;       // auto-learned peer addrs (ip_be<<16 | host_port) -> last-seen
   bool have_session = false;
   BrokerEntry self_session{};
   bool have_arb = false;
@@ -683,6 +687,18 @@ void NetThreadMain() {
         const uint8_t* pay = buf + sizeof(WireHdr);
         int plen = n - (int)sizeof(WireHdr);
         uint32_t src_ip = ntohl(from.sin_addr.s_addr);
+        if (h.magic == kWireMagic) {  // learn the sender's address so a host needn't know joiner IPs ahead
+          uint64_t lk = ((uint64_t)from.sin_addr.s_addr << 16) | ntohs(from.sin_port);
+          bool is_new;
+          {
+            std::lock_guard<std::mutex> g(net_store().mu);
+            is_new = net_store().learned.find(lk) == net_store().learned.end();
+            net_store().learned[lk] = (int64_t)::time(nullptr);
+          }
+          if (is_new)
+            BrokerTrace("NETBROKER: learned peer %u.%u.%u.%u:%u", (src_ip >> 24) & 0xFF,
+                        (src_ip >> 16) & 0xFF, (src_ip >> 8) & 0xFF, src_ip & 0xFF, ntohs(from.sin_port));
+        }
         if (h.magic == kWireMagic && h.kind == 1 && h.len == sizeof(BrokerEntry) &&
             plen == (int)sizeof(BrokerEntry)) {
           BrokerEntry e;
@@ -711,6 +727,7 @@ void NetThreadMain() {
       BrokerEntry se{};
       ArbEntry ae{};
       bool hs, ha;
+      std::vector<NetPeer> targets = peers;  // configured peers ∪ auto-learned peers
       {
         std::lock_guard<std::mutex> lk(net_store().mu);
         hs = net_store().have_session;
@@ -727,9 +744,20 @@ void NetThreadMain() {
           it = (ts - it->second.ts > kBrokerTtlSec) ? net_store().sessions.erase(it) : std::next(it);
         for (auto it = net_store().arbs.begin(); it != net_store().arbs.end();)
           it = (ts - it->second.ts > kBrokerTtlSec) ? net_store().arbs.erase(it) : std::next(it);
+        for (auto it = net_store().learned.begin(); it != net_store().learned.end();) {
+          if (ts - it->second > kBrokerTtlSec) { it = net_store().learned.erase(it); continue; }
+          NetPeer p{(uint32_t)(it->first >> 16), (uint16_t)(it->first & 0xFFFF)};
+          bool dup = false;
+          for (auto& t : targets)
+            if (t.ip_be == p.ip_be && t.port == p.port) { dup = true; break; }
+          if (!dup) targets.push_back(p);
+          ++it;
+        }
       }
-      if (hs) NetSendTo(s, peers, 1, &se, sizeof se);
-      if (ha) NetSendTo(s, peers, 2, &ae, sizeof ae);
+      uint32_t beacon = (uint32_t)self;  // announce ourselves so a host with no static peers learns our addr
+      NetSendTo(s, targets, 3, &beacon, sizeof beacon);
+      if (hs) NetSendTo(s, targets, 1, &se, sizeof se);
+      if (ha) NetSendTo(s, targets, 2, &ae, sizeof ae);
     }
   }
 }
