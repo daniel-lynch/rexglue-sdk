@@ -348,6 +348,19 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
         " from={} setting_id={:08X} data.type={}",
         n, (uint32_t)setting.from, (uint32_t)setting.setting_id, setting.data.type);
 
+    // [COD4MP-PROFWRITE] Always-on capture (gated COD4_PROFILE_WRITELOG) so we can see EXACTLY which
+    // setting ids + data types the game writes when saving a custom class — used to find where the
+    // custom-class loadout (currently not persisted) goes, or whether it hits the Unimplemented drop below.
+    if (std::getenv("COD4_PROFILE_WRITELOG")) {
+      unsigned sz = (setting_type == UserProfile::Setting::Type::BINARY ||
+                     setting_type == UserProfile::Setting::Type::CONTENT)
+                        ? (unsigned)setting.data.binary.size
+                        : 0u;
+      std::fprintf(stderr, "[COD4MP-PROFWRITE] setting_id=%08X data.type=%u binsize=%u\n",
+                   (uint32_t)setting.setting_id, (unsigned)setting.data.type, sz);
+      std::fflush(stderr);
+    }
+
     switch (setting_type) {
       case UserProfile::Setting::Type::CONTENT:
       case UserProfile::Setting::Type::BINARY: {
